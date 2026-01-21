@@ -1,2 +1,3 @@
 add_subdirectory(triangle)
 add_subdirectory(rt_triangle)
+add_subdirectory(meshlets)
