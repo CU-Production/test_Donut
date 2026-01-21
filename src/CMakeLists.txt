@@ -1,3 +1,5 @@
 add_subdirectory(triangle)
 add_subdirectory(rt_triangle)
 add_subdirectory(meshlets)
+add_subdirectory(rt_scene)
+add_subdirectory(mitsuba_scene)
