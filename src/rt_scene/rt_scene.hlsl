@@ -47,7 +47,8 @@ struct GPUMaterial
     // Mask/Blend parameters
     float opacity;         // Opacity for mask material
     float blendWeight;     // Blend weight for blendbsdf
-    float2 padding;
+    float nonlinear;       // Nonlinear mode for plastic (0 or 1)
+    float padding;
 };
 
 struct GPUInstance
@@ -195,6 +196,7 @@ MaterialParams GPUMaterialToParams(GPUMaterial gpuMat)
     // Mask/Blend parameters
     params.opacity = gpuMat.opacity;
     params.blendWeight = gpuMat.blendWeight;
+    params.nonlinear = gpuMat.nonlinear;
     
     return params;
 }

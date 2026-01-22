@@ -62,6 +62,7 @@ struct MaterialParams
     // Mask/Blend parameters
     float opacity;         // Opacity for mask material [0, 1]
     float blendWeight;     // Blend weight for blendbsdf [0, 1]
+    float nonlinear;       // Nonlinear mode for plastic (0 or 1)
 };
 
 // Convert MaterialParams to PrincipledParams
@@ -123,7 +124,7 @@ float3 Material_Evaluate(MaterialParams mat, float3 wo, float3 wi, float3 normal
             
         case MATERIAL_PLASTIC:
         case MATERIAL_ROUGH_PLASTIC:
-            return Plastic_Evaluate(mat.baseColor, mat.roughness, mat.intIOR, mat.extIOR, wo, wi, normal);
+            return Plastic_EvaluateNonlinear(mat.baseColor, mat.roughness, mat.intIOR, mat.extIOR, wo, wi, normal, mat.nonlinear > 0.5f);
         
         case MATERIAL_THIN_DIELECTRIC:
             return ThinDielectric_Evaluate(mat.intIOR, mat.extIOR, wo, wi, normal);
@@ -233,7 +234,7 @@ float3 Material_Sample(MaterialParams mat, float3 wo, float3 normal, float2 u,
         
         case MATERIAL_PLASTIC:
         case MATERIAL_ROUGH_PLASTIC:
-            return Plastic_Sample(mat.baseColor, mat.roughness, mat.intIOR, mat.extIOR, wo, normal, u, throughputWeight, pdf);
+            return Plastic_SampleNonlinear(mat.baseColor, mat.roughness, mat.intIOR, mat.extIOR, wo, normal, u, mat.nonlinear > 0.5f, throughputWeight, pdf);
         
         case MATERIAL_THIN_DIELECTRIC:
         {

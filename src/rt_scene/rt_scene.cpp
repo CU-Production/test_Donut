@@ -84,7 +84,8 @@ struct GPUMaterial
     // Mask/Blend parameters
     float opacity;         // Opacity for mask material
     float blendWeight;     // Blend weight for blendbsdf
-    float padding[2];
+    float nonlinear;       // Nonlinear mode for plastic (0 or 1)
+    float padding;
 };
 
 struct GPUVertex
@@ -277,10 +278,12 @@ public:
             };
             uint32_t typeIdx = static_cast<uint32_t>(mat.type);
             const char* typeName = (typeIdx < 12) ? typeNames[typeIdx] : "Unknown";
-            log::info("  Material '%s': type=%s, roughness=%.2f, baseColor=(%.2f,%.2f,%.2f), texIdx=%d",
+            log::info("  Material '%s': type=%s, roughness=%.3f, baseColor=(%.2f,%.2f,%.2f), intIOR=%.2f, extIOR=%.2f, texIdx=%d, nonlinear=%s",
                 id.c_str(), typeName, mat.roughness, 
                 mat.baseColor.X, mat.baseColor.Y, mat.baseColor.Z,
-                mat.baseColorTexture.textureIndex);
+                mat.intIOR, mat.extIOR,
+                mat.baseColorTexture.textureIndex,
+                mat.nonlinear ? "true" : "false");
         }
         if (environmentMap.isValid)
         {
@@ -868,6 +871,11 @@ private:
                 int index = static_cast<int>(loadedTextures.size());
                 textureIndexMap[filename] = index;
                 loadedTextures.push_back(std::move(texData));
+                log::info("Loaded texture [%d]: %s (%dx%d)", index, filename.c_str(), texData.width, texData.height);
+            }
+            else
+            {
+                log::error("Failed to load texture: %s", texturePath.string().c_str());
             }
         }
         
@@ -1184,6 +1192,8 @@ public:
             // Mask/Blend parameters
             gpuMat.opacity = mat.opacity;
             gpuMat.blendWeight = mat.blendWeight;
+            gpuMat.nonlinear = mat.nonlinear ? 1.0f : 0.0f;
+            gpuMat.padding = 0.0f;
             
             m_Materials.push_back(gpuMat);
         }
@@ -1352,6 +1362,8 @@ public:
             gpuMat.specTrans = mat.specTrans;
             gpuMat.opacity = mat.opacity;
             gpuMat.blendWeight = mat.blendWeight;
+            gpuMat.nonlinear = mat.nonlinear ? 1.0f : 0.0f;
+            gpuMat.padding = 0.0f;
             matIndex = static_cast<uint32_t>(m_Materials.size());
             m_Materials.push_back(gpuMat);
         }
@@ -1458,6 +1470,8 @@ public:
             gpuMat.specTrans = mat.specTrans;
             gpuMat.opacity = mat.opacity;
             gpuMat.blendWeight = mat.blendWeight;
+            gpuMat.nonlinear = mat.nonlinear ? 1.0f : 0.0f;
+            gpuMat.padding = 0.0f;
             matIndex = static_cast<uint32_t>(m_Materials.size());
             m_Materials.push_back(gpuMat);
         }
@@ -2011,7 +2025,7 @@ protected:
             
             // Max bounces control
             int maxBounces = static_cast<int>(m_pScene->GetMaxBounces());
-            if (ImGui::SliderInt("Max Bounces", &maxBounces, 1, 32))
+            if (ImGui::SliderInt("Max Bounces", &maxBounces, 1, 256))
             {
                 m_pScene->GetMaxBounces() = static_cast<uint32_t>(maxBounces);
                 m_pScene->ResetAccumulation();
