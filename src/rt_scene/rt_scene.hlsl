@@ -364,6 +364,46 @@ void RayGen()
     
     float3 rayOrigin = Camera.cameraPosition;
     
+    // DEBUG MODE: Set to 1 to visualize material base colors directly, 0 for normal rendering
+    #define DEBUG_MATERIAL_COLOR 0
+    
+    #if DEBUG_MATERIAL_COLOR
+    {
+        // Debug: trace one ray and output material base color directly
+        RayDesc debugRay;
+        debugRay.Origin = rayOrigin;
+        debugRay.Direction = rayDir;
+        debugRay.TMin = RAY_EPSILON;
+        debugRay.TMax = 10000.0f;
+        
+        HitInfo debugPayload;
+        debugPayload.hitT = -1.0f;
+        debugPayload.instanceID = 0xFFFFFFFF;
+        
+        TraceRay(SceneBVH, RAY_FLAG_NONE, 0xFF, 0, 2, 0, debugRay, debugPayload);
+        
+        float3 debugColor = float3(0.0f, 0.0f, 0.0f);
+        if (debugPayload.hitT > 0.0f)
+        {
+            GPUInstance instance = Instances[debugPayload.instanceID];
+            GPUMaterial mat = GetMaterialWithTextures(instance.materialIndex, debugPayload.texcoord);
+            
+            // Output base color directly (gamma corrected for display)
+            debugColor = pow(mat.baseColor, 1.0f / 2.2f);
+            
+            // If emitter, show emission (scaled down for visibility)
+            if (instance.isEmitter != 0)
+            {
+                debugColor = float3(1.0f, 0.9f, 0.7f);  // Mark emitters with warm white
+            }
+        }
+        
+        OutputTexture[launchIndex] = float4(debugColor, 1.0f);
+        AccumulationTexture[launchIndex] = float4(debugColor, 1.0f);
+        return;
+    }
+    #endif
+    
     // Path tracing
     float3 radiance = float3(0.0f, 0.0f, 0.0f);
     float3 throughput = float3(1.0f, 1.0f, 1.0f);
@@ -488,7 +528,7 @@ void RayGen()
     {
         radiance = float3(0.0f, 0.0f, 0.0f);
     }
-    radiance = clamp(radiance, 0.0f, 100.0f);  // Clamp to reasonable range
+    radiance = clamp(radiance, 0.0f, 1000.0f);  // Clamp to reasonable range (increased for bright lights)
     
     // Accumulation
     float3 prevColor = AccumulationTexture[launchIndex].xyz;
@@ -517,9 +557,24 @@ void RayGen()
     
     AccumulationTexture[launchIndex] = float4(newColor, sampleCount);
     
-    // Tone mapping and gamma correction
-    float3 finalColor = newColor / (newColor + 1.0f);  // Reinhard tone mapping
-    finalColor = pow(finalColor, 1.0f / 2.2f);          // Gamma correction
+    // Exposure control - apply before tone mapping
+    // Mitsuba scenes often have high radiance values, need proper exposure
+    // Area light radiance ~125, wall reflectance ~0.58
+    // Single bounce contribution ~72, need very low exposure
+    float exposure = 0.015f;  // Very low exposure for bright Mitsuba scenes
+    float3 exposed = newColor * exposure;
+    
+    // ACES filmic tone mapping (better for high dynamic range)
+    // Based on: https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/
+    float a = 2.51f;
+    float b = 0.03f;
+    float c = 2.43f;
+    float d = 0.59f;
+    float e = 0.14f;
+    float3 finalColor = saturate((exposed * (a * exposed + b)) / (exposed * (c * exposed + d) + e));
+    
+    // Gamma correction
+    finalColor = pow(finalColor, 1.0f / 2.2f);
     
     OutputTexture[launchIndex] = float4(finalColor, 1.0f);
 }

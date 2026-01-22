@@ -143,12 +143,12 @@ public:
     {
         std::string id;
         MaterialType type = MaterialType::Diffuse;
-        HMM_Vec3 baseColor = HMM_V3(0.5f, 0.5f, 0.5f);
-        float roughness = 0.5f;
+        HMM_Vec3 baseColor = HMM_V3(0.5f, 0.5f, 0.5f);  // Mitsuba default: 0.5
+        float roughness = 0.1f;   // Mitsuba default alpha: 0.1 (NOT 0.5!)
         HMM_Vec3 eta = HMM_V3(1.0f, 1.0f, 1.0f);
         HMM_Vec3 k = HMM_V3(0.0f, 0.0f, 0.0f);
-        float intIOR = 1.5f;
-        float extIOR = 1.0f;
+        float intIOR = 1.5046f;   // Mitsuba default: bk7 (1.5046)
+        float extIOR = 1.000277f; // Mitsuba default: air (1.000277)
         float metallic = 0.0f;
         
         // Principled BSDF parameters
@@ -163,6 +163,9 @@ public:
         // Mask/Blend parameters
         float opacity = 1.0f;
         float blendWeight = 0.5f;
+        
+        // Plastic-specific parameters
+        bool nonlinear = false;  // Mitsuba default: false (preserve texture colors)
         
         // Texture references
         TextureRef baseColorTexture;
@@ -390,7 +393,8 @@ private:
         if (type == "diffuse")
         {
             mat.type = MaterialType::Diffuse;
-            mat.roughness = 1.0f;
+            mat.roughness = 1.0f;  // Lambertian diffuse - roughness doesn't apply
+            mat.baseColor = HMM_V3(0.5f, 0.5f, 0.5f);  // Mitsuba default reflectance
         }
         else if (type == "conductor")
         {
@@ -401,6 +405,7 @@ private:
         else if (type == "roughconductor")
         {
             mat.type = MaterialType::RoughConductor;
+            mat.roughness = 0.1f;  // Mitsuba default alpha
             mat.baseColor = HMM_V3(1.0f, 1.0f, 1.0f);  // Default specular reflectance
         }
         else if (type == "dielectric")
@@ -411,15 +416,19 @@ private:
         else if (type == "roughdielectric")
         {
             mat.type = MaterialType::RoughDielectric;
+            mat.roughness = 0.1f;  // Mitsuba default alpha
         }
         else if (type == "plastic")
         {
             mat.type = MaterialType::Plastic;
-            mat.roughness = 0.0f;
+            mat.roughness = 0.0f;  // Smooth plastic
+            mat.intIOR = 1.49f;    // Mitsuba default: polypropylene
         }
         else if (type == "roughplastic")
         {
             mat.type = MaterialType::RoughPlastic;
+            mat.roughness = 0.1f;  // Mitsuba default alpha
+            mat.intIOR = 1.49f;    // Mitsuba default: polypropylene
         }
         else if (type == "thindielectric")
         {
@@ -452,10 +461,11 @@ private:
             std::string childName = child.name();
             std::string propName = child.attribute("name").value();
 
-            if (childName == "rgb")
+            if (childName == "rgb" || childName == "spectrum")
             {
                 HMM_Vec3 color = ParseRGB(child.attribute("value").value());
-                if (propName == "reflectance" || propName == "diffuse_reflectance" || propName == "specular_reflectance")
+                if (propName == "reflectance" || propName == "diffuse_reflectance" || 
+                    propName == "specular_reflectance" || propName == "base_color")
                 {
                     mat.baseColor = color;
                 }
@@ -471,7 +481,14 @@ private:
             else if (childName == "float")
             {
                 float value = child.attribute("value").as_float();
-                if (propName == "alpha" || propName == "roughness")
+                if (propName == "alpha")
+                {
+                    // Mitsuba's alpha is the GGX roughness directly
+                    // Our shader squares roughness to get alpha, so we take sqrt here
+                    // to get the correct final alpha value
+                    mat.roughness = sqrtf(value);
+                }
+                else if (propName == "roughness")
                 {
                     mat.roughness = value;
                 }
@@ -591,6 +608,38 @@ private:
                     }
                     // Add more presets as needed
                 }
+                // Mitsuba dielectric IOR presets (for int_ior / ext_ior)
+                else if (propName == "int_ior" || propName == "ext_ior")
+                {
+                    float ior = 1.0f;
+                    // Mitsuba IOR preset table
+                    if (value == "vacuum")              ior = 1.0f;
+                    else if (value == "helium")         ior = 1.00004f;
+                    else if (value == "hydrogen")       ior = 1.00013f;
+                    else if (value == "air")            ior = 1.000277f;
+                    else if (value == "carbon dioxide") ior = 1.00045f;
+                    else if (value == "water")          ior = 1.333f;
+                    else if (value == "acetone")        ior = 1.36f;
+                    else if (value == "ethanol")        ior = 1.361f;
+                    else if (value == "carbon tetrachloride") ior = 1.461f;
+                    else if (value == "glycerol")       ior = 1.4729f;
+                    else if (value == "benzene")        ior = 1.501f;
+                    else if (value == "silicone oil")   ior = 1.52045f;
+                    else if (value == "bromine")        ior = 1.661f;
+                    else if (value == "water ice")      ior = 1.31f;
+                    else if (value == "fused quartz")   ior = 1.458f;
+                    else if (value == "pyrex")          ior = 1.470f;
+                    else if (value == "acrylic glass")  ior = 1.49f;
+                    else if (value == "polypropylene")  ior = 1.49f;
+                    else if (value == "bk7")            ior = 1.5046f;
+                    else if (value == "sodium chloride") ior = 1.544f;
+                    else if (value == "amber")          ior = 1.55f;
+                    else if (value == "pet")            ior = 1.575f;
+                    else if (value == "diamond")        ior = 2.419f;
+                    
+                    if (propName == "int_ior") mat.intIOR = ior;
+                    else mat.extIOR = ior;
+                }
             }
             else if (childName == "texture")
             {
@@ -606,6 +655,15 @@ private:
                     {
                         mat.roughnessTexture = texRef;
                     }
+                }
+            }
+            else if (childName == "boolean")
+            {
+                std::string value = child.attribute("value").value();
+                bool boolValue = (value == "true" || value == "1");
+                if (propName == "nonlinear")
+                {
+                    mat.nonlinear = boolValue;
                 }
             }
         }
