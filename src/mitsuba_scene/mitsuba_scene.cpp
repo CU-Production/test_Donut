@@ -13,8 +13,12 @@
 #define TINYOBJ_LOADER_C_IMPLEMENTATION
 #include <tinyobj_loader_c.h>
 
+// Texture loading utilities
+#include "../common/texture_utils.h"
+
 #include <filesystem>
 #include <unordered_map>
+#include <unordered_set>
 #include <sstream>
 #include <cmath>
 #include <algorithm>
@@ -41,6 +45,8 @@ struct PerObjectConstants
     float roughness;
     float emission[3];
     uint32_t isEmitter;
+    uint32_t hasBaseColorTex;
+    float padding[3];
 };
 
 struct LightConstants
@@ -69,11 +75,20 @@ public:
         int height = 720;
     };
 
+    // Texture reference structure
+    struct TextureRef
+    {
+        std::string filename;
+        bool isValid = false;
+        int textureIndex = -1;
+    };
+
     struct Material
     {
         std::string id;
         HMM_Vec3 baseColor = HMM_V3(0.5f, 0.5f, 0.5f);
         float roughness = 0.5f;
+        TextureRef baseColorTexture;
     };
 
     struct Shape
@@ -93,6 +108,10 @@ public:
     std::unordered_map<std::string, Material> materials;
     std::vector<Shape> shapes;
     std::filesystem::path sceneDirectory;
+    
+    // Loaded textures
+    std::unordered_map<std::string, int> textureIndexMap;
+    std::vector<texture_utils::TextureData> loadedTextures;
 
     bool Parse(const std::filesystem::path& xmlPath)
     {
@@ -136,7 +155,11 @@ public:
             }
         }
 
-        log::info("Parsed %zu materials and %zu shapes", materials.size(), shapes.size());
+        // Load all referenced textures
+        LoadReferencedTextures();
+
+        log::info("Parsed %zu materials, %zu shapes, %zu textures", 
+            materials.size(), shapes.size(), loadedTextures.size());
         return true;
     }
 
@@ -261,6 +284,27 @@ private:
                     mat.roughness = value;
                 }
             }
+            else if (childName == "texture")
+            {
+                // Parse texture reference
+                std::string texType = child.attribute("type").value();
+                if (texType == "bitmap")
+                {
+                    for (pugi::xml_node texChild : child.children("string"))
+                    {
+                        std::string texPropName = texChild.attribute("name").value();
+                        if (texPropName == "filename")
+                        {
+                            std::string filename = texChild.attribute("value").value();
+                            if (propName == "reflectance" || propName == "diffuse_reflectance")
+                            {
+                                mat.baseColorTexture.filename = filename;
+                                mat.baseColorTexture.isValid = true;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         return mat;
@@ -319,6 +363,70 @@ private:
 
         shapes.push_back(shape);
     }
+    
+    // Load all referenced textures
+    void LoadReferencedTextures()
+    {
+        std::unordered_set<std::string> textureFiles;
+        
+        // Collect texture filenames from materials
+        for (auto& [id, mat] : materials)
+        {
+            if (mat.baseColorTexture.isValid && !mat.baseColorTexture.filename.empty())
+            {
+                textureFiles.insert(mat.baseColorTexture.filename);
+            }
+        }
+        
+        // Also check inline materials in shapes
+        for (auto& shape : shapes)
+        {
+            if (shape.hasInlineMaterial && shape.inlineMaterial.baseColorTexture.isValid)
+            {
+                textureFiles.insert(shape.inlineMaterial.baseColorTexture.filename);
+            }
+        }
+        
+        // Load each unique texture
+        for (const auto& filename : textureFiles)
+        {
+            std::filesystem::path texturePath = sceneDirectory / filename;
+            texture_utils::TextureData texData = texture_utils::LoadTexture(texturePath);
+            
+            if (texData.IsValid())
+            {
+                int index = static_cast<int>(loadedTextures.size());
+                textureIndexMap[filename] = index;
+                loadedTextures.push_back(std::move(texData));
+            }
+        }
+        
+        // Update material texture indices
+        for (auto& [id, mat] : materials)
+        {
+            if (mat.baseColorTexture.isValid && !mat.baseColorTexture.filename.empty())
+            {
+                auto it = textureIndexMap.find(mat.baseColorTexture.filename);
+                if (it != textureIndexMap.end())
+                {
+                    mat.baseColorTexture.textureIndex = it->second;
+                }
+            }
+        }
+        
+        // Update inline material texture indices
+        for (auto& shape : shapes)
+        {
+            if (shape.hasInlineMaterial && shape.inlineMaterial.baseColorTexture.isValid)
+            {
+                auto it = textureIndexMap.find(shape.inlineMaterial.baseColorTexture.filename);
+                if (it != textureIndexMap.end())
+                {
+                    shape.inlineMaterial.baseColorTexture.textureIndex = it->second;
+                }
+            }
+        }
+    }
 };
 
 // ============================================================================
@@ -368,6 +476,7 @@ struct RenderMesh
     float roughness;
     HMM_Vec3 emission;
     bool isEmitter;
+    int baseColorTexIdx = -1;  // Index into material textures, -1 if none
 };
 
 // ============================================================================
@@ -388,6 +497,11 @@ private:
     // Depth buffer and framebuffer
     nvrhi::TextureHandle m_DepthTexture;
     nvrhi::BindingSetHandle m_BindingSet;
+    
+    // Textures
+    std::vector<nvrhi::TextureHandle> m_MaterialTextures;
+    nvrhi::TextureHandle m_DefaultTexture;  // 1x1 white texture for materials without textures
+    nvrhi::SamplerHandle m_LinearSampler;
 
     std::vector<RenderMesh> m_Meshes;
     
@@ -462,12 +576,26 @@ public:
         };
         m_InputLayout = GetDevice()->createInputLayout(attributes, 3, m_VertexShader);
 
-        // Create binding layout
+        // Create sampler
+        nvrhi::SamplerDesc samplerDesc;
+        samplerDesc.setAllFilters(true);
+        samplerDesc.setAllAddressModes(nvrhi::SamplerAddressMode::Wrap);
+        m_LinearSampler = GetDevice()->createSampler(samplerDesc);
+        
+        if (!m_LinearSampler)
+        {
+            log::error("Failed to create linear sampler");
+            return false;
+        }
+
+        // Create binding layout (with texture support)
         nvrhi::BindingLayoutDesc bindingLayoutDesc;
         bindingLayoutDesc.visibility = nvrhi::ShaderType::All;
         bindingLayoutDesc.bindings = {
             nvrhi::BindingLayoutItem::ConstantBuffer(0),  // PerObject
-            nvrhi::BindingLayoutItem::ConstantBuffer(1)   // Light
+            nvrhi::BindingLayoutItem::ConstantBuffer(1),  // Light
+            nvrhi::BindingLayoutItem::Texture_SRV(0),     // BaseColorTexture
+            nvrhi::BindingLayoutItem::Sampler(0)          // LinearSampler
         };
         m_BindingLayout = GetDevice()->createBindingLayout(bindingLayoutDesc);
 
@@ -485,6 +613,9 @@ public:
         m_LightBuffer = GetDevice()->createBuffer(cbDesc);
 
         m_CommandList = GetDevice()->createCommandList();
+        
+        // Create textures (needs command list)
+        CreateMaterialTextures();
 
         // Load meshes from scene
         LoadSceneMeshes();
@@ -493,6 +624,61 @@ public:
         InitializeCamera();
 
         return true;
+    }
+    
+    void CreateMaterialTextures()
+    {
+        m_CommandList->open();
+        
+        // Create default 1x1 white texture
+        {
+            nvrhi::TextureDesc texDesc;
+            texDesc.width = 1;
+            texDesc.height = 1;
+            texDesc.format = nvrhi::Format::RGBA8_UNORM;
+            texDesc.initialState = nvrhi::ResourceStates::ShaderResource;
+            texDesc.keepInitialState = true;
+            texDesc.debugName = "DefaultWhiteTexture";
+            m_DefaultTexture = GetDevice()->createTexture(texDesc);
+            
+            if (!m_DefaultTexture)
+            {
+                log::error("Failed to create default texture");
+                m_CommandList->close();
+                return;
+            }
+            
+            uint32_t white = 0xFFFFFFFF;
+            m_CommandList->writeTexture(m_DefaultTexture, 0, 0, &white, sizeof(white));
+        }
+        
+        log::info("Created default white texture");
+        
+        // Create textures from loaded texture data
+        for (const auto& texData : m_SceneParser.loadedTextures)
+        {
+            nvrhi::TextureDesc texDesc;
+            texDesc.width = texData.width;
+            texDesc.height = texData.height;
+            texDesc.format = nvrhi::Format::RGBA32_FLOAT;
+            texDesc.initialState = nvrhi::ResourceStates::ShaderResource;
+            texDesc.keepInitialState = true;
+            texDesc.debugName = texData.path.c_str();
+            
+            nvrhi::TextureHandle texture = GetDevice()->createTexture(texDesc);
+            m_CommandList->writeTexture(texture, 0, 0, 
+                texData.data.data(), texData.width * 4 * sizeof(float));
+            
+            m_MaterialTextures.push_back(texture);
+        }
+        
+        m_CommandList->close();
+        GetDevice()->executeCommandList(m_CommandList);
+        
+        if (!m_MaterialTextures.empty())
+        {
+            log::info("Created %zu material textures", m_MaterialTextures.size());
+        }
     }
 
     void LoadSceneMeshes()
@@ -633,16 +819,19 @@ public:
             auto& mat = m_SceneParser.materials[shape.materialRef];
             mesh.baseColor = mat.baseColor;
             mesh.roughness = mat.roughness;
+            mesh.baseColorTexIdx = mat.baseColorTexture.textureIndex;
         }
         else if (shape.hasInlineMaterial)
         {
             mesh.baseColor = shape.inlineMaterial.baseColor;
             mesh.roughness = shape.inlineMaterial.roughness;
+            mesh.baseColorTexIdx = shape.inlineMaterial.baseColorTexture.textureIndex;
         }
         else
         {
             mesh.baseColor = HMM_V3(0.5f, 0.5f, 0.5f);
             mesh.roughness = 0.5f;
+            mesh.baseColorTexIdx = -1;
         }
 
         mesh.isEmitter = shape.isEmitter;
@@ -713,11 +902,13 @@ public:
         {
             mesh.baseColor = shape.inlineMaterial.baseColor;
             mesh.roughness = shape.inlineMaterial.roughness;
+            mesh.baseColorTexIdx = shape.inlineMaterial.baseColorTexture.textureIndex;
         }
         else
         {
             mesh.baseColor = HMM_V3(0.5f, 0.5f, 0.5f);
             mesh.roughness = 0.5f;
+            mesh.baseColorTexIdx = -1;
         }
 
         mesh.isEmitter = shape.isEmitter;
@@ -887,16 +1078,7 @@ public:
             m_Pipeline = GetDevice()->createGraphicsPipeline(psoDesc, renderFramebuffer->getFramebufferInfo());
         }
 
-        // Create binding set if needed (cached)
-        if (!m_BindingSet)
-        {
-            nvrhi::BindingSetDesc bindingSetDesc;
-            bindingSetDesc.bindings = {
-                nvrhi::BindingSetItem::ConstantBuffer(0, m_PerObjectBuffer),
-                nvrhi::BindingSetItem::ConstantBuffer(1, m_LightBuffer)
-            };
-            m_BindingSet = GetDevice()->createBindingSet(bindingSetDesc, m_BindingLayout);
-        }
+        // Binding sets are created per-mesh in the render loop (for per-mesh textures)
 
         // Calculate view/projection matrices using HandmadeMath
         float aspect = float(fbinfo.width) / float(fbinfo.height);
@@ -943,6 +1125,15 @@ public:
 
         // Debug: print first frame info
         static bool firstFrame = true;
+        if (firstFrame)
+        {
+            log::info("=== DEBUG BINDINGS ===");
+            log::info("m_DefaultTexture: %p", m_DefaultTexture.Get());
+            log::info("m_LinearSampler: %p", m_LinearSampler.Get());
+            log::info("m_PerObjectBuffer: %p", m_PerObjectBuffer.Get());
+            log::info("m_LightBuffer: %p", m_LightBuffer.Get());
+            log::info("m_MaterialTextures count: %zu", m_MaterialTextures.size());
+        }
         if (firstFrame && !m_Meshes.empty())
         {
             log::info("=== DEBUG MVP ===");
@@ -992,12 +1183,45 @@ public:
             perObject.emission[1] = mesh.emission.Y;
             perObject.emission[2] = mesh.emission.Z;
             perObject.isEmitter = mesh.isEmitter ? 1 : 0;
+            perObject.hasBaseColorTex = (mesh.baseColorTexIdx >= 0) ? 1 : 0;
             m_CommandList->writeBuffer(m_PerObjectBuffer, &perObject, sizeof(PerObjectConstants));
+            
+            // Select texture for this mesh
+            nvrhi::TextureHandle baseColorTex = m_DefaultTexture;
+            if (mesh.baseColorTexIdx >= 0 && mesh.baseColorTexIdx < static_cast<int>(m_MaterialTextures.size()))
+            {
+                baseColorTex = m_MaterialTextures[mesh.baseColorTexIdx];
+            }
+            
+            // Ensure all binding resources are valid
+            if (!m_PerObjectBuffer || !m_LightBuffer || !baseColorTex || !m_LinearSampler)
+            {
+                log::error("Invalid binding resources: perObj=%p, light=%p, tex=%p, sampler=%p", 
+                    m_PerObjectBuffer.Get(), m_LightBuffer.Get(),
+                    baseColorTex.Get(), m_LinearSampler.Get());
+                continue;
+            }
+            
+            // Create binding set for this draw (with per-mesh texture)
+            nvrhi::BindingSetDesc bindingSetDesc;
+            bindingSetDesc.bindings = {
+                nvrhi::BindingSetItem::ConstantBuffer(0, m_PerObjectBuffer),
+                nvrhi::BindingSetItem::ConstantBuffer(1, m_LightBuffer),
+                nvrhi::BindingSetItem::Texture_SRV(0, baseColorTex),
+                nvrhi::BindingSetItem::Sampler(0, m_LinearSampler)
+            };
+            nvrhi::BindingSetHandle bindingSet = GetDevice()->createBindingSet(bindingSetDesc, m_BindingLayout);
+            
+            if (!bindingSet)
+            {
+                log::error("Failed to create binding set");
+                continue;
+            }
 
             nvrhi::GraphicsState state;
             state.pipeline = m_Pipeline;
             state.framebuffer = renderFramebuffer;
-            state.bindings = { m_BindingSet };
+            state.bindings = { bindingSet };
             state.vertexBuffers = { { mesh.vertexBuffer, 0, 0 } };
             state.indexBuffer = { mesh.indexBuffer, nvrhi::Format::R32_UINT, 0 };
             state.viewport.addViewportAndScissorRect(renderFramebuffer->getFramebufferInfo().getViewport());

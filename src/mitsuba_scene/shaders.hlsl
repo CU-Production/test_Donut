@@ -10,6 +10,8 @@ cbuffer PerObjectConstants : register(b0)
     float g_Roughness;
     float3 g_Emission;
     uint g_IsEmitter;
+    uint g_HasBaseColorTex;
+    float3 _pad_obj;
 };
 
 cbuffer LightConstants : register(b1)
@@ -23,6 +25,12 @@ cbuffer LightConstants : register(b1)
     float3 g_CameraPos;
     float _pad3;
 };
+
+// ============================================================================
+// Textures and Samplers
+// ============================================================================
+Texture2D<float4> g_BaseColorTex : register(t0);
+SamplerState g_LinearSampler : register(s0);
 
 // ============================================================================
 // Vertex Shader Input/Output
@@ -108,8 +116,13 @@ float4 main_ps(VSOutput input) : SV_Target
     float3 V = normalize(g_CameraPos - input.worldPos);  // View direction from surface to camera
     float3 H = normalize(L + V);
     
-    // Material properties
+    // Material properties - sample texture if available
     float3 albedo = g_BaseColor;
+    if (g_HasBaseColorTex != 0)
+    {
+        float4 texColor = g_BaseColorTex.Sample(g_LinearSampler, input.texcoord);
+        albedo = texColor.rgb;
+    }
     float roughness = max(g_Roughness, 0.04f);  // Minimum roughness to avoid artifacts
     float metallic = 0.0f;  // Simple diffuse assumption
     

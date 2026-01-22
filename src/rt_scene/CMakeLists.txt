@@ -19,3 +19,9 @@ add_executable(${project} WIN32 ${sources})
 target_link_libraries(${project} donut_app donut_engine pugixml tinyobj hmm)
 add_dependencies(${project} ${project}_shaders)
 set_target_properties(${project} PROPERTIES FOLDER ${folder})
+
+# Include paths for stb_image and tinyexr
+target_include_directories(${project} PRIVATE 
+    ${CMAKE_SOURCE_DIR}/3rd_party/Donut/thirdparty/stb
+    ${CMAKE_SOURCE_DIR}/3rd_party/Donut/thirdparty/tinyexr
+)

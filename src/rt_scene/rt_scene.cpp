@@ -16,8 +16,12 @@
 #define TINYOBJ_LOADER_C_IMPLEMENTATION
 #include <tinyobj_loader_c.h>
 
+// Texture loading utilities
+#include "../common/texture_utils.h"
+
 #include <filesystem>
 #include <unordered_map>
+#include <unordered_set>
 #include <sstream>
 #include <cmath>
 
@@ -53,9 +57,13 @@ struct GPUMaterial
     float k[3];            // For conductors: complex IOR imaginary part
     uint32_t type;
     
-    float intIOR;        // Interior index of refraction
-    float extIOR;        // Exterior index of refraction
-    float padding[2];
+    float intIOR;          // Interior index of refraction
+    float extIOR;          // Exterior index of refraction
+    int32_t baseColorTexIdx;   // -1 if no texture
+    int32_t roughnessTexIdx;   // -1 if no texture
+    
+    int32_t normalTexIdx;      // -1 if no texture
+    float padding[3];
 };
 
 struct GPUVertex
@@ -86,7 +94,8 @@ struct CameraConstants
     uint32_t frameIndex;
     uint32_t samplesPerPixel;
     uint32_t maxBounces;
-    float padding[2];
+    float envMapIntensity;
+    uint32_t hasEnvMap;
 };
 
 // ============================================================================
@@ -103,6 +112,14 @@ public:
         int height = 720;
     };
 
+    // Texture reference structure
+    struct TextureRef
+    {
+        std::string filename;
+        bool isValid = false;
+        int textureIndex = -1;  // Index into loaded textures array
+    };
+
     struct Material
     {
         std::string id;
@@ -113,6 +130,19 @@ public:
         HMM_Vec3 k = HMM_V3(0.0f, 0.0f, 0.0f);
         float intIOR = 1.5f;
         float extIOR = 1.0f;
+        
+        // Texture references
+        TextureRef baseColorTexture;
+        TextureRef roughnessTexture;
+        TextureRef normalTexture;
+    };
+    
+    // Environment map structure
+    struct EnvironmentMapInfo
+    {
+        std::string filename;
+        float intensity = 1.0f;
+        bool isValid = false;
     };
 
     struct Shape
@@ -133,6 +163,13 @@ public:
     std::unordered_map<std::string, Material> materials;
     std::vector<Shape> shapes;
     std::filesystem::path sceneDirectory;
+    
+    // Environment map
+    EnvironmentMapInfo environmentMap;
+    
+    // Loaded textures (indexed by material texture references)
+    std::unordered_map<std::string, int> textureIndexMap;
+    std::vector<texture_utils::TextureData> loadedTextures;
 
     bool Parse(const std::filesystem::path& xmlPath)
     {
@@ -175,9 +212,26 @@ public:
             {
                 ParseShape(node);
             }
+            else if (nodeName == "emitter")
+            {
+                ParseEmitter(node);
+            }
+            else if (nodeName == "texture")
+            {
+                ParseTextureDefinition(node);
+            }
         }
 
-        log::info("Parsed %zu materials and %zu shapes", materials.size(), shapes.size());
+        // Load all referenced textures
+        LoadReferencedTextures();
+
+        log::info("Parsed %zu materials, %zu shapes, %zu textures", 
+            materials.size(), shapes.size(), loadedTextures.size());
+        if (environmentMap.isValid)
+        {
+            log::info("Environment map: %s (intensity: %.2f)", 
+                environmentMap.filename.c_str(), environmentMap.intensity);
+        }
         return true;
     }
 
@@ -357,6 +411,22 @@ private:
                     mat.extIOR = value;
                 }
             }
+            else if (childName == "texture")
+            {
+                // Parse texture reference
+                TextureRef texRef = ParseTextureRef(child);
+                if (texRef.isValid)
+                {
+                    if (propName == "reflectance" || propName == "diffuse_reflectance")
+                    {
+                        mat.baseColorTexture = texRef;
+                    }
+                    else if (propName == "alpha" || propName == "roughness")
+                    {
+                        mat.roughnessTexture = texRef;
+                    }
+                }
+            }
         }
 
         return mat;
@@ -419,6 +489,173 @@ private:
         }
 
         shapes.push_back(shape);
+    }
+
+    // Parse global emitter (environment map)
+    void ParseEmitter(pugi::xml_node emitterNode)
+    {
+        std::string type = emitterNode.attribute("type").value();
+        
+        // Environment map emitter
+        if (type == "envmap")
+        {
+            for (pugi::xml_node child : emitterNode.children("string"))
+            {
+                std::string name = child.attribute("name").value();
+                if (name == "filename")
+                {
+                    environmentMap.filename = child.attribute("value").value();
+                    environmentMap.isValid = true;
+                }
+            }
+            
+            for (pugi::xml_node child : emitterNode.children("float"))
+            {
+                std::string name = child.attribute("name").value();
+                if (name == "scale")
+                {
+                    environmentMap.intensity = child.attribute("value").as_float(1.0f);
+                }
+            }
+            
+            // Also check for intensity in rgb format
+            for (pugi::xml_node child : emitterNode.children("rgb"))
+            {
+                std::string name = child.attribute("name").value();
+                if (name == "scale")
+                {
+                    HMM_Vec3 scale = ParseRGB(child.attribute("value").value());
+                    environmentMap.intensity = (scale.X + scale.Y + scale.Z) / 3.0f;
+                }
+            }
+            
+            log::info("Found environment map: %s", environmentMap.filename.c_str());
+        }
+        // Constant environment
+        else if (type == "constant")
+        {
+            // Could be extended to support constant environment color
+        }
+    }
+    
+    // Parse standalone texture definition
+    void ParseTextureDefinition(pugi::xml_node textureNode)
+    {
+        std::string id = textureNode.attribute("id").value();
+        std::string type = textureNode.attribute("type").value();
+        
+        if (type == "bitmap")
+        {
+            for (pugi::xml_node child : textureNode.children("string"))
+            {
+                std::string name = child.attribute("name").value();
+                if (name == "filename")
+                {
+                    std::string filename = child.attribute("value").value();
+                    // Store for later loading
+                    textureIndexMap[id] = -1;  // Will be updated when loaded
+                    log::info("Found texture definition: %s -> %s", id.c_str(), filename.c_str());
+                }
+            }
+        }
+    }
+    
+    // Parse texture reference in BSDF
+    TextureRef ParseTextureRef(pugi::xml_node textureNode)
+    {
+        TextureRef ref;
+        std::string type = textureNode.attribute("type").value();
+        
+        if (type == "bitmap")
+        {
+            for (pugi::xml_node child : textureNode.children("string"))
+            {
+                std::string name = child.attribute("name").value();
+                if (name == "filename")
+                {
+                    ref.filename = child.attribute("value").value();
+                    ref.isValid = true;
+                }
+            }
+        }
+        else if (type == "ref")
+        {
+            // Reference to a standalone texture definition
+            std::string refId = textureNode.attribute("id").value();
+            if (textureIndexMap.find(refId) != textureIndexMap.end())
+            {
+                ref.isValid = true;
+                // Filename will be resolved later
+            }
+        }
+        
+        return ref;
+    }
+    
+    // Load all referenced textures
+    void LoadReferencedTextures()
+    {
+        std::unordered_set<std::string> textureFiles;
+        
+        // Collect texture filenames from materials
+        for (auto& [id, mat] : materials)
+        {
+            if (mat.baseColorTexture.isValid && !mat.baseColorTexture.filename.empty())
+            {
+                textureFiles.insert(mat.baseColorTexture.filename);
+            }
+            if (mat.roughnessTexture.isValid && !mat.roughnessTexture.filename.empty())
+            {
+                textureFiles.insert(mat.roughnessTexture.filename);
+            }
+            if (mat.normalTexture.isValid && !mat.normalTexture.filename.empty())
+            {
+                textureFiles.insert(mat.normalTexture.filename);
+            }
+        }
+        
+        // Load each unique texture
+        for (const auto& filename : textureFiles)
+        {
+            std::filesystem::path texturePath = sceneDirectory / filename;
+            texture_utils::TextureData texData = texture_utils::LoadTexture(texturePath);
+            
+            if (texData.IsValid())
+            {
+                int index = static_cast<int>(loadedTextures.size());
+                textureIndexMap[filename] = index;
+                loadedTextures.push_back(std::move(texData));
+            }
+        }
+        
+        // Update material texture indices
+        for (auto& [id, mat] : materials)
+        {
+            if (mat.baseColorTexture.isValid && !mat.baseColorTexture.filename.empty())
+            {
+                auto it = textureIndexMap.find(mat.baseColorTexture.filename);
+                if (it != textureIndexMap.end())
+                {
+                    mat.baseColorTexture.textureIndex = it->second;
+                }
+            }
+            if (mat.roughnessTexture.isValid && !mat.roughnessTexture.filename.empty())
+            {
+                auto it = textureIndexMap.find(mat.roughnessTexture.filename);
+                if (it != textureIndexMap.end())
+                {
+                    mat.roughnessTexture.textureIndex = it->second;
+                }
+            }
+            if (mat.normalTexture.isValid && !mat.normalTexture.filename.empty())
+            {
+                auto it = textureIndexMap.find(mat.normalTexture.filename);
+                if (it != textureIndexMap.end())
+                {
+                    mat.normalTexture.textureIndex = it->second;
+                }
+            }
+        }
     }
 };
 
@@ -484,6 +721,11 @@ private:
     // Render target
     nvrhi::TextureHandle m_RenderTarget;
     nvrhi::TextureHandle m_AccumulationTarget;
+    
+    // Textures
+    nvrhi::TextureHandle m_EnvironmentMap;
+    std::vector<nvrhi::TextureHandle> m_MaterialTextures;
+    nvrhi::SamplerHandle m_LinearSampler;
 
     // Render passes
     std::shared_ptr<engine::CommonRenderPasses> m_CommonPasses;
@@ -562,6 +804,12 @@ public:
         m_BindingCache = std::make_unique<engine::BindingCache>(GetDevice());
         m_CommonPasses = std::make_shared<engine::CommonRenderPasses>(GetDevice(), shaderFactory);
 
+        // Create sampler for textures
+        nvrhi::SamplerDesc samplerDesc;
+        samplerDesc.setAllFilters(true);
+        samplerDesc.setAllAddressModes(nvrhi::SamplerAddressMode::Wrap);
+        m_LinearSampler = GetDevice()->createSampler(samplerDesc);
+
         // Create binding layout
         nvrhi::BindingLayoutDesc bindingLayoutDesc;
         bindingLayoutDesc.visibility = nvrhi::ShaderType::All;
@@ -571,9 +819,11 @@ public:
             nvrhi::BindingLayoutItem::StructuredBuffer_SRV(2),      // t2: Indices
             nvrhi::BindingLayoutItem::StructuredBuffer_SRV(3),      // t3: Materials
             nvrhi::BindingLayoutItem::StructuredBuffer_SRV(4),      // t4: Instances
+            nvrhi::BindingLayoutItem::Texture_SRV(5),               // t5: Environment map
             nvrhi::BindingLayoutItem::Texture_UAV(0),               // u0: Output
             nvrhi::BindingLayoutItem::Texture_UAV(1),               // u1: Accumulation
-            nvrhi::BindingLayoutItem::ConstantBuffer(0)             // b0: Camera
+            nvrhi::BindingLayoutItem::ConstantBuffer(0),            // b0: Camera
+            nvrhi::BindingLayoutItem::Sampler(0)                    // s0: Linear sampler
         };
         m_BindingLayout = GetDevice()->createBindingLayout(bindingLayoutDesc);
 
@@ -616,6 +866,10 @@ public:
 
         m_CommandList = GetDevice()->createCommandList();
 
+        // Create textures (needs command list)
+        CreateEnvironmentMapTexture();
+        CreateMaterialTextures();
+
         // Create GPU buffers and acceleration structures
         CreateGPUResources();
 
@@ -649,6 +903,9 @@ public:
             gpuMat.intIOR = mat.intIOR;
             gpuMat.extIOR = mat.extIOR;
             gpuMat.metallic = (mat.type == MaterialType::Conductor || mat.type == MaterialType::RoughConductor) ? 1.0f : 0.0f;
+            gpuMat.baseColorTexIdx = mat.baseColorTexture.textureIndex;
+            gpuMat.roughnessTexIdx = mat.roughnessTexture.textureIndex;
+            gpuMat.normalTexIdx = mat.normalTexture.textureIndex;
             m_Materials.push_back(gpuMat);
         }
 
@@ -801,6 +1058,9 @@ public:
             gpuMat.intIOR = shape.inlineMaterial.intIOR;
             gpuMat.extIOR = shape.inlineMaterial.extIOR;
             gpuMat.metallic = 0.0f;
+            gpuMat.baseColorTexIdx = shape.inlineMaterial.baseColorTexture.textureIndex;
+            gpuMat.roughnessTexIdx = shape.inlineMaterial.roughnessTexture.textureIndex;
+            gpuMat.normalTexIdx = shape.inlineMaterial.normalTexture.textureIndex;
             matIndex = static_cast<uint32_t>(m_Materials.size());
             m_Materials.push_back(gpuMat);
         }
@@ -892,6 +1152,9 @@ public:
             gpuMat.intIOR = shape.inlineMaterial.intIOR;
             gpuMat.extIOR = shape.inlineMaterial.extIOR;
             gpuMat.metallic = 0.0f;
+            gpuMat.baseColorTexIdx = shape.inlineMaterial.baseColorTexture.textureIndex;
+            gpuMat.roughnessTexIdx = shape.inlineMaterial.roughnessTexture.textureIndex;
+            gpuMat.normalTexIdx = shape.inlineMaterial.normalTexture.textureIndex;
             matIndex = static_cast<uint32_t>(m_Materials.size());
             m_Materials.push_back(gpuMat);
         }
@@ -974,6 +1237,87 @@ public:
 
         m_CommandList->close();
         GetDevice()->executeCommandList(m_CommandList);
+    }
+    
+    void CreateEnvironmentMapTexture()
+    {
+        // Load environment map if specified
+        if (m_SceneParser.environmentMap.isValid)
+        {
+            std::filesystem::path envMapPath = m_SceneParser.sceneDirectory / m_SceneParser.environmentMap.filename;
+            texture_utils::TextureData envMapData = texture_utils::LoadTexture(envMapPath);
+            
+            if (envMapData.IsValid())
+            {
+                nvrhi::TextureDesc textureDesc;
+                textureDesc.width = envMapData.width;
+                textureDesc.height = envMapData.height;
+                textureDesc.format = nvrhi::Format::RGBA32_FLOAT;
+                textureDesc.initialState = nvrhi::ResourceStates::ShaderResource;
+                textureDesc.keepInitialState = true;
+                textureDesc.debugName = "EnvironmentMap";
+                
+                m_EnvironmentMap = GetDevice()->createTexture(textureDesc);
+                
+                m_CommandList->open();
+                m_CommandList->writeTexture(m_EnvironmentMap, 0, 0, 
+                    envMapData.data.data(), envMapData.width * 4 * sizeof(float));
+                m_CommandList->close();
+                GetDevice()->executeCommandList(m_CommandList);
+                
+                log::info("Created environment map texture: %dx%d", envMapData.width, envMapData.height);
+            }
+        }
+        
+        // Create a default 1x1 black texture if no environment map
+        if (!m_EnvironmentMap)
+        {
+            nvrhi::TextureDesc textureDesc;
+            textureDesc.width = 1;
+            textureDesc.height = 1;
+            textureDesc.format = nvrhi::Format::RGBA32_FLOAT;
+            textureDesc.initialState = nvrhi::ResourceStates::ShaderResource;
+            textureDesc.keepInitialState = true;
+            textureDesc.debugName = "DefaultEnvironmentMap";
+            
+            m_EnvironmentMap = GetDevice()->createTexture(textureDesc);
+            
+            float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            m_CommandList->open();
+            m_CommandList->writeTexture(m_EnvironmentMap, 0, 0, black, sizeof(black));
+            m_CommandList->close();
+            GetDevice()->executeCommandList(m_CommandList);
+        }
+    }
+    
+    void CreateMaterialTextures()
+    {
+        // Create textures from loaded texture data
+        for (const auto& texData : m_SceneParser.loadedTextures)
+        {
+            nvrhi::TextureDesc textureDesc;
+            textureDesc.width = texData.width;
+            textureDesc.height = texData.height;
+            textureDesc.format = nvrhi::Format::RGBA32_FLOAT;
+            textureDesc.initialState = nvrhi::ResourceStates::ShaderResource;
+            textureDesc.keepInitialState = true;
+            textureDesc.debugName = texData.path.c_str();
+            
+            nvrhi::TextureHandle texture = GetDevice()->createTexture(textureDesc);
+            
+            m_CommandList->open();
+            m_CommandList->writeTexture(texture, 0, 0, 
+                texData.data.data(), texData.width * 4 * sizeof(float));
+            m_CommandList->close();
+            GetDevice()->executeCommandList(m_CommandList);
+            
+            m_MaterialTextures.push_back(texture);
+        }
+        
+        if (!m_MaterialTextures.empty())
+        {
+            log::info("Created %zu material textures", m_MaterialTextures.size());
+        }
     }
 
     void BuildAccelerationStructures()
@@ -1214,9 +1558,11 @@ public:
                 nvrhi::BindingSetItem::StructuredBuffer_SRV(2, m_IndexBuffer),
                 nvrhi::BindingSetItem::StructuredBuffer_SRV(3, m_MaterialBuffer),
                 nvrhi::BindingSetItem::StructuredBuffer_SRV(4, m_InstanceBuffer),
+                nvrhi::BindingSetItem::Texture_SRV(5, m_EnvironmentMap),
                 nvrhi::BindingSetItem::Texture_UAV(0, m_RenderTarget),
                 nvrhi::BindingSetItem::Texture_UAV(1, m_AccumulationTarget),
-                nvrhi::BindingSetItem::ConstantBuffer(0, m_CameraBuffer)
+                nvrhi::BindingSetItem::ConstantBuffer(0, m_CameraBuffer),
+                nvrhi::BindingSetItem::Sampler(0, m_LinearSampler)
             };
             m_BindingSet = GetDevice()->createBindingSet(bindingSetDesc, m_BindingLayout);
         }
@@ -1244,6 +1590,8 @@ public:
         m_CameraConstants.cameraPosition[1] = m_CameraPosition.Y;
         m_CameraConstants.cameraPosition[2] = m_CameraPosition.Z;
         m_CameraConstants.frameIndex = m_FrameIndex;
+        m_CameraConstants.envMapIntensity = m_SceneParser.environmentMap.intensity;
+        m_CameraConstants.hasEnvMap = m_SceneParser.environmentMap.isValid ? 1 : 0;
 
         // Debug: print first frame info
         static bool firstFrame = true;

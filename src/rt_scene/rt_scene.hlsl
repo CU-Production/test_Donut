@@ -42,7 +42,11 @@ struct GPUMaterial
     
     float intIOR;
     float extIOR;
-    float2 padding;
+    int baseColorTexIdx;   // -1 if no texture
+    int roughnessTexIdx;   // -1 if no texture
+    
+    int normalTexIdx;      // -1 if no texture
+    float3 padding;
 };
 
 struct GPUInstance
@@ -63,7 +67,8 @@ struct CameraConstants
     uint frameIndex;
     uint samplesPerPixel;
     uint maxBounces;
-    float2 padding;
+    float envMapIntensity;
+    uint hasEnvMap;
 };
 
 struct HitInfo
@@ -93,6 +98,7 @@ StructuredBuffer<GPUVertex> Vertices           : register(t1);
 StructuredBuffer<uint> Indices                 : register(t2);
 StructuredBuffer<GPUMaterial> Materials        : register(t3);
 StructuredBuffer<GPUInstance> Instances        : register(t4);
+Texture2D<float4> EnvironmentMap               : register(t5);
 
 RWTexture2D<float4> OutputTexture              : register(u0);
 RWTexture2D<float4> AccumulationTexture        : register(u1);
@@ -101,6 +107,29 @@ cbuffer CameraBuffer : register(b0)
 {
     CameraConstants Camera;
 };
+
+SamplerState LinearSampler                     : register(s0);
+
+// ============================================================================
+// Environment Map Sampling
+// ============================================================================
+float3 SampleEnvironmentMap(float3 direction)
+{
+    // Convert direction to spherical coordinates (equirectangular mapping)
+    // Theta: azimuth angle (around Y axis)
+    // Phi: elevation angle (from Y axis)
+    float theta = atan2(direction.x, direction.z);
+    float phi = asin(clamp(direction.y, -1.0f, 1.0f));
+    
+    // Convert to UV coordinates [0, 1]
+    float u = (theta + PI) / (2.0f * PI);
+    float v = (phi + PI * 0.5f) / PI;
+    
+    // Sample the environment map
+    float3 envColor = EnvironmentMap.SampleLevel(LinearSampler, float2(u, v), 0).rgb;
+    
+    return envColor * Camera.envMapIntensity;
+}
 
 // ============================================================================
 // Random Number Generator (PCG)
@@ -431,10 +460,19 @@ void RayGen()
         
         if (payload.hitT < 0.0f)
         {
-            // Miss - add background color
-            float3 skyColor = lerp(float3(0.5f, 0.7f, 1.0f), float3(0.8f, 0.9f, 1.0f), 
-                                   saturate(ray.Direction.y * 0.5f + 0.5f));
-            radiance += throughput * skyColor * 0.3f;
+            // Miss - sample environment map or use procedural sky
+            float3 envColor;
+            if (Camera.hasEnvMap != 0)
+            {
+                envColor = SampleEnvironmentMap(ray.Direction);
+            }
+            else
+            {
+                // Procedural sky fallback
+                envColor = lerp(float3(0.5f, 0.7f, 1.0f), float3(0.8f, 0.9f, 1.0f), 
+                               saturate(ray.Direction.y * 0.5f + 0.5f)) * 0.3f;
+            }
+            radiance += throughput * envColor;
             break;
         }
         
