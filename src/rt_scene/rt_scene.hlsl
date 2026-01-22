@@ -136,11 +136,13 @@ float3 SampleEnvironmentMap(float3 direction)
     // Theta: azimuth angle (around Y axis)
     // Phi: elevation angle (from Y axis)
     float theta = atan2(direction.x, direction.z);
-    float phi = asin(clamp(direction.y, -1.0f, 1.0f));
+    float elevation = asin(clamp(direction.y, -1.0f, 1.0f));
     
     // Convert to UV coordinates [0, 1]
+    // Match Donut's convention: uv.y = 0.5 - elevation / PI
+    // This ensures correct orientation (top of image = +Y direction)
     float u = (theta + PI) / (2.0f * PI);
-    float v = (phi + PI * 0.5f) / PI;
+    float v = 0.5f - elevation / PI;
     
     // Sample the environment map
     float3 envColor = EnvironmentMap.SampleLevel(LinearSampler, float2(u, v), 0).rgb;

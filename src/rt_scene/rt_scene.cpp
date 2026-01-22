@@ -2408,7 +2408,13 @@ int main(int __argc, const char** __argv)
         log::info("No scene file specified. Please provide a Mitsuba scene XML file.");
         
         // Try to use a default path for testing
-        scenePath = "E:/SW/CG/mitsuba3/scenes/bathroom2/bathroom2/scene.xml";
+        // scenePath = "E:/SW/CG/mitsuba3/scenes/bathroom/bathroom/scene.xml";
+        // scenePath = "E:/SW/CG/mitsuba3/scenes/bathroom2/bathroom2/scene.xml";
+        // scenePath = "E:/SW/CG/mitsuba3/scenes/bedroom/bedroom/scene.xml";
+        // scenePath = "E:/SW/CG/mitsuba3/scenes/classroom/classroom/scene.xml";
+        // scenePath = "E:/SW/CG/mitsuba3/scenes/dining-room/dining-room/scene.xml";
+        // scenePath = "E:/SW/CG/mitsuba3/scenes/kitchen/kitchen/scene.xml";
+        scenePath = "E:/SW/CG/mitsuba3/scenes/living-room-2/living-room-2/scene.xml";
         log::info("Trying default path: %s", scenePath.string().c_str());
     }
 
