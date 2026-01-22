@@ -1111,8 +1111,10 @@ public:
             false
         } };
 
-        pipelineDesc.maxPayloadSize = sizeof(float) * 8;  // HitInfo struct
-        pipelineDesc.maxRecursionDepth = 8;
+        // HitInfo struct size: float3 color (12) + float hitT (4) + float3 emission (12) + 
+        // uint instanceID (4) + float2 texcoord (8) + float2 padding (8) = 48 bytes
+        pipelineDesc.maxPayloadSize = 48;
+        pipelineDesc.maxRecursionDepth = 2;  // We only do iterative tracing, not recursive
 
         m_Pipeline = GetDevice()->createRayTracingPipeline(pipelineDesc);
 
