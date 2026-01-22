@@ -20,6 +20,8 @@ cbuffer LightConstants : register(b1)
     float _pad1;
     float3 g_AmbientColor;
     float _pad2;
+    float3 g_CameraPos;
+    float _pad3;
 };
 
 // ============================================================================
@@ -47,14 +49,16 @@ VSOutput main_vs(VSInput input)
 {
     VSOutput output;
     
-    // Transform position to clip space
-    output.position = mul(float4(input.position, 1.0f), g_WorldViewProj);
+    // Transform position to clip space using MVP matrix (column-vector convention: M * v)
+    output.position = mul(g_WorldViewProj, float4(input.position, 1.0f));
     
-    // Pass world position (vertices are already in world space)
-    output.worldPos = input.position;
+    // Transform position to world space using model matrix (column-vector convention)
+    float4 worldPos4 = mul(g_World, float4(input.position, 1.0f));
+    output.worldPos = worldPos4.xyz;
     
-    // Pass normal (already transformed)
-    output.normal = normalize(input.normal);
+    // Transform normal to world space (using upper 3x3 of world matrix)
+    // For non-uniform scaling, should use inverse transpose, but for now assume uniform scale
+    output.normal = normalize(mul((float3x3)g_World, input.normal));
     
     // Pass texcoord
     output.texcoord = input.texcoord;
@@ -101,7 +105,7 @@ float4 main_ps(VSOutput input) : SV_Target
     // Normalize interpolated normal
     float3 N = normalize(input.normal);
     float3 L = normalize(g_LightDir);
-    float3 V = normalize(-input.worldPos);  // Simplified view direction
+    float3 V = normalize(g_CameraPos - input.worldPos);  // View direction from surface to camera
     float3 H = normalize(L + V);
     
     // Material properties
