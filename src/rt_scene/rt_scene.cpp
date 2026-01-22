@@ -1179,30 +1179,46 @@ public:
         SetupCameraFromScene();
 
 #if DONUT_WITH_DLSS
-        // Initialize DLSS
+        // Initialize DLSS - note: this only creates the DLSS object, Init() is called later with resolution
+        // This matches FeatureDemo.cpp: DLSS doesn't need to be re-created when we reload shaders
+        std::string executableDir = app::GetDirectoryWithExecutable().generic_string();
+        log::info("Initializing DLSS from directory: %s", executableDir.c_str());
+        
         m_DLSS = render::DLSS::Create(GetDevice(), *shaderFactory, 
-            app::GetDirectoryWithExecutable().string(), render::DLSS::DefaultApplicationID);
+            executableDir, render::DLSS::DefaultApplicationID);
         
         if (m_DLSS)
         {
-            m_DLSSAvailable = m_DLSS->IsRayReconstructionSupported();
-            if (m_DLSSAvailable)
+            // Check DLSS availability - IsDlssSupported() checks if NGX was initialized successfully
+            // and if DLSS feature is available on this system
+            if (m_DLSS->IsDlssSupported())
             {
-                log::info("DLSS Ray Reconstruction is available");
-            }
-            else if (m_DLSS->IsDlssSupported())
-            {
-                log::info("DLSS is available (but Ray Reconstruction is not)");
-                m_DLSSAvailable = true;  // Can still use regular DLSS
+                m_DLSSAvailable = true;
+                if (m_DLSS->IsRayReconstructionSupported())
+                {
+                    log::info("DLSS Ray Reconstruction is available");
+                }
+                else
+                {
+                    log::info("DLSS is available (Ray Reconstruction not supported)");
+                }
             }
             else
             {
                 log::warning("DLSS is not available on this system");
+                log::warning("This may be due to:");
+                log::warning("  1. NGX DLL not found or failed to load (check RuntimeLibrary mismatch)");
+                log::warning("  2. No NVIDIA RTX GPU detected");
+                log::warning("  3. DLSS driver version too old");
+                log::warning("  4. NGX initialization failed");
+                m_DLSSAvailable = false;
             }
         }
         else
         {
-            log::warning("Failed to create DLSS instance");
+            log::warning("Failed to create DLSS instance - DLSS::Create() returned nullptr");
+            log::warning("This usually means the graphics API is not supported or NGX failed to initialize");
+            m_DLSSAvailable = false;
         }
 #endif
 
@@ -1996,9 +2012,83 @@ public:
                 dlssParams.inputHeight = fbinfo.height;
                 dlssParams.outputWidth = fbinfo.width;
                 dlssParams.outputHeight = fbinfo.height;
-                dlssParams.useRayReconstruction = m_DLSS->IsRayReconstructionSupported();
                 dlssParams.useAutoExposure = true;
+                // useLinearDepth = false for hardware depth (D3D12 depth format is non-linear)
+                // This matches Donut's default behavior for standard depth buffers
+                dlssParams.useLinearDepth = false;
+                
+                // Try with Ray Reconstruction first if supported, fallback to regular DLSS if it fails
+                bool useRayReconstruction = m_DLSS->IsRayReconstructionSupported();
+                dlssParams.useRayReconstruction = useRayReconstruction;
+                
+                log::info("Attempting DLSS Init at resolution %dx%d (RayReconstruction=%s)", 
+                    fbinfo.width, fbinfo.height, useRayReconstruction ? "true" : "false");
+                
                 m_DLSS->Init(dlssParams);
+                
+                // Update availability based on actual initialization result
+                // Note: When using Ray Reconstruction, check IsRayReconstructionInitialized() instead of IsDlssInitialized()
+                bool initialized = useRayReconstruction 
+                    ? m_DLSS->IsRayReconstructionInitialized() 
+                    : m_DLSS->IsDlssInitialized();
+                
+                if (initialized)
+                {
+                    m_DLSSAvailable = true;
+                    if (useRayReconstruction)
+                    {
+                        log::info("DLSS Ray Reconstruction initialized successfully at resolution %dx%d", 
+                            fbinfo.width, fbinfo.height);
+                    }
+                    else
+                    {
+                        log::info("DLSS initialized successfully at resolution %dx%d", 
+                            fbinfo.width, fbinfo.height);
+                    }
+                }
+                else
+                {
+                    // If Ray Reconstruction failed, try regular DLSS
+                    if (useRayReconstruction)
+                    {
+                        log::warning("DLSS Ray Reconstruction Init() failed, trying regular DLSS...");
+                        dlssParams.useRayReconstruction = false;
+                        m_DLSS->Init(dlssParams);
+                        
+                        if (m_DLSS->IsDlssInitialized())
+                        {
+                            m_DLSSAvailable = true;
+                            log::info("DLSS (without Ray Reconstruction) initialized successfully at resolution %dx%d", 
+                                fbinfo.width, fbinfo.height);
+                        }
+                        else
+                        {
+                            m_DLSSAvailable = false;
+                            log::warning("DLSS Init() failed even without Ray Reconstruction");
+                            log::warning("Resolution: %dx%d, useLinearDepth: %s, useAutoExposure: %s", 
+                                fbinfo.width, fbinfo.height, 
+                                dlssParams.useLinearDepth ? "true" : "false",
+                                dlssParams.useAutoExposure ? "true" : "false");
+                            log::warning("Possible causes:");
+                            log::warning("  1. Resolution too small (DLSS requires minimum resolution)");
+                            log::warning("  2. Missing required textures (depth, motion vectors)");
+                            log::warning("  3. NGX CreateFeature failed - check DLSS library logs");
+                        }
+                    }
+                    else
+                    {
+                        m_DLSSAvailable = false;
+                        log::warning("DLSS Init() failed - DLSS may not be available or initialization parameters are incorrect");
+                        log::warning("Resolution: %dx%d, useLinearDepth: %s, useAutoExposure: %s", 
+                            fbinfo.width, fbinfo.height, 
+                            dlssParams.useLinearDepth ? "true" : "false",
+                            dlssParams.useAutoExposure ? "true" : "false");
+                        log::warning("Possible causes:");
+                        log::warning("  1. Resolution too small (DLSS requires minimum resolution)");
+                        log::warning("  2. Missing required textures (depth, motion vectors)");
+                        log::warning("  3. NGX CreateFeature failed - check DLSS library logs");
+                    }
+                }
             }
 #endif
 
@@ -2259,6 +2349,16 @@ int main(int __argc, const char** __argv)
 #ifdef _DEBUG
     deviceParams.enableDebugRuntime = true;
     deviceParams.enableNvrhiValidationLayer = true;
+#endif
+
+#if DONUT_WITH_DLSS
+    // DLSS requires specific Vulkan extensions - must be added BEFORE device creation
+    if (api == nvrhi::GraphicsAPI::VULKAN)
+    {
+        render::DLSS::GetRequiredVulkanExtensions(
+            deviceParams.optionalVulkanInstanceExtensions,
+            deviceParams.optionalVulkanDeviceExtensions);
+    }
 #endif
 
     if (!deviceManager->CreateWindowDeviceAndSwapChain(deviceParams, g_WindowTitle))

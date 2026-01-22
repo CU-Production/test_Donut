@@ -20,6 +20,14 @@ target_link_libraries(${project} donut_app donut_engine donut_render pugixml tin
 add_dependencies(${project} ${project}_shaders)
 set_target_properties(${project} PROPERTIES FOLDER ${folder})
 
+# Ensure RuntimeLibrary matches DLSS static library (/MT for Release, /MTd for Debug)
+# This is critical for DLSS to work - NGX DLL must match the runtime library
+if(MSVC)
+    set_target_properties(${project} PROPERTIES
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
+endif()
+
 # Link DLSS if available
 if(TARGET DLSS)
     target_link_libraries(${project} DLSS)
