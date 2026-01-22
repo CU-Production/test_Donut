@@ -6,10 +6,12 @@
 #include <donut/app/DeviceManager.h>
 #include <donut/core/log.h>
 #include <donut/core/vfs/VFS.h>
-#include <donut/core/math/math.h>
 #include <nvrhi/utils.h>
 
 #include <pugixml.hpp>
+
+#define HANDMADE_MATH_USE_RADIANS
+#include "HandmadeMath.h"
 
 #define TINYOBJ_LOADER_C_IMPLEMENTATION
 #include <tinyobj_loader_c.h>
@@ -17,9 +19,9 @@
 #include <filesystem>
 #include <unordered_map>
 #include <sstream>
+#include <cmath>
 
 using namespace donut;
-using namespace donut::math;
 
 static const char* g_WindowTitle = "Donut Example: Mitsuba Scene Ray Tracer";
 
@@ -38,32 +40,32 @@ enum class MaterialType : uint32_t
 };
 
 // ============================================================================
-// GPU Structures (must match HLSL)
+// GPU Structures (must match HLSL) - using plain floats for GPU compatibility
 // ============================================================================
 struct GPUMaterial
 {
-    float3 baseColor;
+    float baseColor[3];
     float roughness;
     
-    float3 eta;          // For conductors: complex IOR real part
+    float eta[3];          // For conductors: complex IOR real part
     float metallic;
     
-    float3 k;            // For conductors: complex IOR imaginary part
+    float k[3];            // For conductors: complex IOR imaginary part
     uint32_t type;
     
     float intIOR;        // Interior index of refraction
     float extIOR;        // Exterior index of refraction
-    float2 padding;
+    float padding[2];
 };
 
 struct GPUVertex
 {
-    float3 position;
+    float position[3];
     float pad0;
-    float3 normal;
+    float normal[3];
     float pad1;
-    float2 texcoord;
-    float2 pad2;
+    float texcoord[2];
+    float pad2[2];
 };
 
 struct GPUInstance
@@ -72,30 +74,30 @@ struct GPUInstance
     uint32_t indexOffset;
     uint32_t materialIndex;
     uint32_t isEmitter;
-    float3 emission;
+    float emission[3];
     float pad;
 };
 
 struct CameraConstants
 {
-    float4x4 viewInverse;
-    float4x4 projInverse;
-    float3 cameraPosition;
+    float viewInverse[16];   // column-major 4x4 matrix
+    float projInverse[16];   // column-major 4x4 matrix
+    float cameraPosition[3];
     uint32_t frameIndex;
     uint32_t samplesPerPixel;
     uint32_t maxBounces;
-    float2 padding;
+    float padding[2];
 };
 
 // ============================================================================
-// Mitsuba Scene Parser
+// Mitsuba Scene Parser - using HandmadeMath
 // ============================================================================
 class MitsubaSceneParser
 {
 public:
     struct Camera
     {
-        float4x4 transform = float4x4::identity();
+        HMM_Mat4 transform = HMM_M4D(1.0f);  // Identity matrix
         float fov = 45.0f;
         int width = 1280;
         int height = 720;
@@ -105,10 +107,10 @@ public:
     {
         std::string id;
         MaterialType type = MaterialType::Diffuse;
-        float3 baseColor = float3(0.5f);
+        HMM_Vec3 baseColor = HMM_V3(0.5f, 0.5f, 0.5f);
         float roughness = 0.5f;
-        float3 eta = float3(1.0f);
-        float3 k = float3(0.0f);
+        HMM_Vec3 eta = HMM_V3(1.0f, 1.0f, 1.0f);
+        HMM_Vec3 k = HMM_V3(0.0f, 0.0f, 0.0f);
         float intIOR = 1.5f;
         float extIOR = 1.0f;
     };
@@ -118,9 +120,9 @@ public:
         std::string type;           // "obj" or "rectangle"
         std::string filename;       // OBJ filename
         std::string materialRef;    // Reference to material ID
-        float4x4 transform = float4x4::identity();
+        HMM_Mat4 transform = HMM_M4D(1.0f);  // Identity matrix
         bool isEmitter = false;
-        float3 emission = float3(0.0f);
+        HMM_Vec3 emission = HMM_V3(0.0f, 0.0f, 0.0f);
         
         // For inline materials
         Material inlineMaterial;
@@ -180,8 +182,10 @@ public:
     }
 
 private:
-    // Parse a 4x4 matrix from Mitsuba format (row-major, 16 floats)
-    float4x4 ParseMatrix(const std::string& matrixStr)
+    // Parse a 4x4 matrix from Mitsuba format to HMM column-major storage
+    // Mitsuba XML text order: m00 m01 m02 m03  m10 m11 m12 m13  m20 m21 m22 m23  m30 m31 m32 m33
+    // HMM stores column-major: Columns[j] contains (m0j, m1j, m2j, m3j)
+    HMM_Mat4 ParseMatrix(const std::string& matrixStr)
     {
         std::istringstream iss(matrixStr);
         float values[16];
@@ -190,19 +194,20 @@ private:
             iss >> values[i];
         }
         
-        // Mitsuba uses row-major, we need column-major
-        return float4x4(
-            values[0], values[4], values[8], values[12],
-            values[1], values[5], values[9], values[13],
-            values[2], values[6], values[10], values[14],
-            values[3], values[7], values[11], values[15]
-        );
+        // Map Mitsuba matrix to HMM columns:
+        // Column j gets all elements m[i][j] for i=0..3
+        HMM_Mat4 result;
+        result.Columns[0] = HMM_V4(values[0], values[4], values[8],  values[12]); // m00,m10,m20,m30
+        result.Columns[1] = HMM_V4(values[1], values[5], values[9],  values[13]); // m01,m11,m21,m31
+        result.Columns[2] = HMM_V4(values[2], values[6], values[10], values[14]); // m02,m12,m22,m32
+        result.Columns[3] = HMM_V4(values[3], values[7], values[11], values[15]); // m03,m13,m23,m33
+        return result;
     }
 
     // Parse RGB color from "r, g, b" format
-    float3 ParseRGB(const std::string& rgbStr)
+    HMM_Vec3 ParseRGB(const std::string& rgbStr)
     {
-        float3 color(0.0f);
+        HMM_Vec3 color = HMM_V3(0.0f, 0.0f, 0.0f);
         std::string cleaned = rgbStr;
         // Remove commas
         for (char& c : cleaned)
@@ -210,7 +215,7 @@ private:
             if (c == ',') c = ' ';
         }
         std::istringstream iss(cleaned);
-        iss >> color.x >> color.y >> color.z;
+        iss >> color.X >> color.Y >> color.Z;
         return color;
     }
 
@@ -289,7 +294,7 @@ private:
         {
             mat.type = MaterialType::Conductor;
             mat.roughness = 0.0f;
-            mat.baseColor = float3(1.0f);
+            mat.baseColor = HMM_V3(1.0f, 1.0f, 1.0f);
         }
         else if (type == "roughconductor")
         {
@@ -322,7 +327,7 @@ private:
 
             if (childName == "rgb")
             {
-                float3 color = ParseRGB(child.attribute("value").value());
+                HMM_Vec3 color = ParseRGB(child.attribute("value").value());
                 if (propName == "reflectance" || propName == "diffuse_reflectance" || propName == "specular_reflectance")
                 {
                     mat.baseColor = color;
@@ -491,12 +496,24 @@ private:
     std::vector<GPUMaterial> m_Materials;
     std::vector<GPUInstance> m_Instances;
 
-    // Camera
+    // Camera (using HMM)
     CameraConstants m_CameraConstants;
-    float3 m_CameraPosition;
-    float3 m_CameraTarget;
-    float3 m_CameraUp;
+    HMM_Vec3 m_CameraPosition;
+    HMM_Vec3 m_CameraTarget;
+    HMM_Vec3 m_CameraUp;
+    float m_CameraYaw = 0.0f;
+    float m_CameraPitch = 0.0f;
+    float m_CameraSpeed = 10.0f;
     uint32_t m_FrameIndex = 0;
+    
+    // Mouse state
+    bool m_MouseDown = false;
+    float m_LastMouseX = 0.0f;
+    float m_LastMouseY = 0.0f;
+    
+    // Keyboard state
+    bool m_KeyW = false, m_KeyS = false, m_KeyA = false, m_KeyD = false;
+    bool m_KeyQ = false, m_KeyE = false;
 
     // Scene path
     std::filesystem::path m_ScenePath;
@@ -618,10 +635,16 @@ public:
         for (auto& [id, mat] : m_SceneParser.materials)
         {
             GPUMaterial gpuMat;
-            gpuMat.baseColor = mat.baseColor;
+            gpuMat.baseColor[0] = mat.baseColor.X;
+            gpuMat.baseColor[1] = mat.baseColor.Y;
+            gpuMat.baseColor[2] = mat.baseColor.Z;
             gpuMat.roughness = mat.roughness;
-            gpuMat.eta = mat.eta;
-            gpuMat.k = mat.k;
+            gpuMat.eta[0] = mat.eta.X;
+            gpuMat.eta[1] = mat.eta.Y;
+            gpuMat.eta[2] = mat.eta.Z;
+            gpuMat.k[0] = mat.k.X;
+            gpuMat.k[1] = mat.k.Y;
+            gpuMat.k[2] = mat.k.Z;
             gpuMat.type = static_cast<uint32_t>(mat.type);
             gpuMat.intIOR = mat.intIOR;
             gpuMat.extIOR = mat.extIOR;
@@ -692,45 +715,50 @@ public:
             {
                 GPUVertex vertex;
 
-                // Position
-                float4 pos = float4(
+                // Position - transform using HMM (column-vector: M * v)
+                HMM_Vec4 pos = HMM_V4(
                     attrib.vertices[3 * idx.v_idx + 0],
                     attrib.vertices[3 * idx.v_idx + 1],
                     attrib.vertices[3 * idx.v_idx + 2],
                     1.0f
                 );
-                pos = pos * shape.transform;
-                vertex.position = float3(pos.x, pos.y, pos.z);
+                HMM_Vec4 worldPos = HMM_MulM4V4(shape.transform, pos);
+                vertex.position[0] = worldPos.X;
+                vertex.position[1] = worldPos.Y;
+                vertex.position[2] = worldPos.Z;
 
-                // Normal
+                // Normal - transform using upper 3x3 of world matrix
                 if (idx.vn_idx >= 0 && attrib.normals)
                 {
-                    float4 normal = float4(
+                    HMM_Vec4 normal = HMM_V4(
                         attrib.normals[3 * idx.vn_idx + 0],
                         attrib.normals[3 * idx.vn_idx + 1],
                         attrib.normals[3 * idx.vn_idx + 2],
                         0.0f
                     );
-                    // Transform normal (use inverse transpose for correct normal transformation)
-                    normal = normal * shape.transform;
-                    vertex.normal = normalize(float3(normal.x, normal.y, normal.z));
+                    HMM_Vec4 worldNormal = HMM_MulM4V4(shape.transform, normal);
+                    HMM_Vec3 n = HMM_NormV3(HMM_V3(worldNormal.X, worldNormal.Y, worldNormal.Z));
+                    vertex.normal[0] = n.X;
+                    vertex.normal[1] = n.Y;
+                    vertex.normal[2] = n.Z;
                 }
                 else
                 {
-                    vertex.normal = float3(0.0f, 1.0f, 0.0f);
+                    vertex.normal[0] = 0.0f;
+                    vertex.normal[1] = 1.0f;
+                    vertex.normal[2] = 0.0f;
                 }
 
                 // Texcoord
                 if (idx.vt_idx >= 0 && attrib.texcoords)
                 {
-                    vertex.texcoord = float2(
-                        attrib.texcoords[2 * idx.vt_idx + 0],
-                        attrib.texcoords[2 * idx.vt_idx + 1]
-                    );
+                    vertex.texcoord[0] = attrib.texcoords[2 * idx.vt_idx + 0];
+                    vertex.texcoord[1] = attrib.texcoords[2 * idx.vt_idx + 1];
                 }
                 else
                 {
-                    vertex.texcoord = float2(0.0f);
+                    vertex.texcoord[0] = 0.0f;
+                    vertex.texcoord[1] = 0.0f;
                 }
 
                 uint32_t newIndex = static_cast<uint32_t>(m_Vertices.size());
@@ -759,10 +787,16 @@ public:
         {
             // Add inline material
             GPUMaterial gpuMat;
-            gpuMat.baseColor = shape.inlineMaterial.baseColor;
+            gpuMat.baseColor[0] = shape.inlineMaterial.baseColor.X;
+            gpuMat.baseColor[1] = shape.inlineMaterial.baseColor.Y;
+            gpuMat.baseColor[2] = shape.inlineMaterial.baseColor.Z;
             gpuMat.roughness = shape.inlineMaterial.roughness;
-            gpuMat.eta = shape.inlineMaterial.eta;
-            gpuMat.k = shape.inlineMaterial.k;
+            gpuMat.eta[0] = shape.inlineMaterial.eta.X;
+            gpuMat.eta[1] = shape.inlineMaterial.eta.Y;
+            gpuMat.eta[2] = shape.inlineMaterial.eta.Z;
+            gpuMat.k[0] = shape.inlineMaterial.k.X;
+            gpuMat.k[1] = shape.inlineMaterial.k.Y;
+            gpuMat.k[2] = shape.inlineMaterial.k.Z;
             gpuMat.type = static_cast<uint32_t>(shape.inlineMaterial.type);
             gpuMat.intIOR = shape.inlineMaterial.intIOR;
             gpuMat.extIOR = shape.inlineMaterial.extIOR;
@@ -777,7 +811,9 @@ public:
         instance.indexOffset = startIndexOffset;
         instance.materialIndex = matIndex;
         instance.isEmitter = shape.isEmitter ? 1 : 0;
-        instance.emission = shape.emission;
+        instance.emission[0] = shape.emission.X;
+        instance.emission[1] = shape.emission.Y;
+        instance.emission[2] = shape.emission.Z;
         m_Instances.push_back(instance);
 
         // Cleanup
@@ -793,34 +829,38 @@ public:
         uint32_t startIndexOffset = static_cast<uint32_t>(m_Indices.size());
 
         // Create a unit rectangle in XY plane, centered at origin
-        float3 positions[4] = {
-            float3(-1.0f, -1.0f, 0.0f),
-            float3( 1.0f, -1.0f, 0.0f),
-            float3( 1.0f,  1.0f, 0.0f),
-            float3(-1.0f,  1.0f, 0.0f)
+        HMM_Vec4 positions[4] = {
+            HMM_V4(-1.0f, -1.0f, 0.0f, 1.0f),
+            HMM_V4( 1.0f, -1.0f, 0.0f, 1.0f),
+            HMM_V4( 1.0f,  1.0f, 0.0f, 1.0f),
+            HMM_V4(-1.0f,  1.0f, 0.0f, 1.0f)
         };
 
-        float3 normal = float3(0.0f, 0.0f, 1.0f);
-        float2 texcoords[4] = {
-            float2(0.0f, 0.0f),
-            float2(1.0f, 0.0f),
-            float2(1.0f, 1.0f),
-            float2(0.0f, 1.0f)
+        HMM_Vec4 normal = HMM_V4(0.0f, 0.0f, 1.0f, 0.0f);
+        float texcoords[4][2] = {
+            {0.0f, 0.0f},
+            {1.0f, 0.0f},
+            {1.0f, 1.0f},
+            {0.0f, 1.0f}
         };
 
         // Transform and add vertices
         for (int i = 0; i < 4; i++)
         {
             GPUVertex vertex;
-            float4 pos = float4(positions[i], 1.0f);
-            pos = pos * shape.transform;
-            vertex.position = float3(pos.x, pos.y, pos.z);
+            HMM_Vec4 worldPos = HMM_MulM4V4(shape.transform, positions[i]);
+            vertex.position[0] = worldPos.X;
+            vertex.position[1] = worldPos.Y;
+            vertex.position[2] = worldPos.Z;
 
-            float4 n = float4(normal, 0.0f);
-            n = n * shape.transform;
-            vertex.normal = normalize(float3(n.x, n.y, n.z));
+            HMM_Vec4 worldNormal = HMM_MulM4V4(shape.transform, normal);
+            HMM_Vec3 n = HMM_NormV3(HMM_V3(worldNormal.X, worldNormal.Y, worldNormal.Z));
+            vertex.normal[0] = n.X;
+            vertex.normal[1] = n.Y;
+            vertex.normal[2] = n.Z;
 
-            vertex.texcoord = texcoords[i];
+            vertex.texcoord[0] = texcoords[i][0];
+            vertex.texcoord[1] = texcoords[i][1];
             m_Vertices.push_back(vertex);
         }
 
@@ -838,10 +878,16 @@ public:
         if (shape.hasInlineMaterial)
         {
             GPUMaterial gpuMat;
-            gpuMat.baseColor = shape.inlineMaterial.baseColor;
+            gpuMat.baseColor[0] = shape.inlineMaterial.baseColor.X;
+            gpuMat.baseColor[1] = shape.inlineMaterial.baseColor.Y;
+            gpuMat.baseColor[2] = shape.inlineMaterial.baseColor.Z;
             gpuMat.roughness = shape.inlineMaterial.roughness;
-            gpuMat.eta = shape.inlineMaterial.eta;
-            gpuMat.k = shape.inlineMaterial.k;
+            gpuMat.eta[0] = shape.inlineMaterial.eta.X;
+            gpuMat.eta[1] = shape.inlineMaterial.eta.Y;
+            gpuMat.eta[2] = shape.inlineMaterial.eta.Z;
+            gpuMat.k[0] = shape.inlineMaterial.k.X;
+            gpuMat.k[1] = shape.inlineMaterial.k.Y;
+            gpuMat.k[2] = shape.inlineMaterial.k.Z;
             gpuMat.type = static_cast<uint32_t>(shape.inlineMaterial.type);
             gpuMat.intIOR = shape.inlineMaterial.intIOR;
             gpuMat.extIOR = shape.inlineMaterial.extIOR;
@@ -856,7 +902,9 @@ public:
         instance.indexOffset = startIndexOffset;
         instance.materialIndex = matIndex;
         instance.isEmitter = shape.isEmitter ? 1 : 0;
-        instance.emission = shape.emission;
+        instance.emission[0] = shape.emission.X;
+        instance.emission[1] = shape.emission.Y;
+        instance.emission[2] = shape.emission.Z;
         m_Instances.push_back(instance);
     }
 
@@ -959,6 +1007,8 @@ public:
             }
 
             // Create BLAS
+            // Note: Indices are stored as global indices, so we use the entire vertex buffer
+            // with no vertex offset. The indices directly reference the correct vertices.
             nvrhi::rt::AccelStructDesc blasDesc;
             blasDesc.isTopLevel = false;
 
@@ -969,10 +1019,10 @@ public:
             triangles.indexFormat = nvrhi::Format::R32_UINT;
             triangles.indexCount = indexCount;
             triangles.vertexBuffer = m_VertexBuffer;
-            triangles.vertexOffset = instance.vertexOffset * sizeof(GPUVertex);
+            triangles.vertexOffset = 0;  // Use global indices - no vertex offset
             triangles.vertexFormat = nvrhi::Format::RGB32_FLOAT;
             triangles.vertexStride = sizeof(GPUVertex);
-            triangles.vertexCount = vertexCount;
+            triangles.vertexCount = static_cast<uint32_t>(m_Vertices.size());  // Total vertex count
             geometryDesc.geometryType = nvrhi::rt::GeometryType::Triangles;
             geometryDesc.flags = nvrhi::rt::GeometryFlags::Opaque;
             blasDesc.bottomLevelGeometries.push_back(geometryDesc);
@@ -987,8 +1037,13 @@ public:
             instanceDesc.instanceMask = 1;
             instanceDesc.instanceID = static_cast<uint32_t>(i);
             instanceDesc.flags = nvrhi::rt::InstanceFlags::TriangleFrontCounterclockwise;
-            float3x4 transform = float3x4::identity();
-            memcpy(instanceDesc.transform, &transform, sizeof(transform));
+            // Identity transform for TLAS instance (row-major 3x4 matrix)
+            float transform[12] = {
+                1.0f, 0.0f, 0.0f, 0.0f,  // row 0
+                0.0f, 1.0f, 0.0f, 0.0f,  // row 1
+                0.0f, 0.0f, 1.0f, 0.0f   // row 2
+            };
+            memcpy(instanceDesc.transform, transform, sizeof(transform));
             tlasInstances.push_back(instanceDesc);
         }
 
@@ -1003,18 +1058,123 @@ public:
 
     void SetupCameraFromScene()
     {
-        // Extract camera position and orientation from transform matrix
-        float4x4 viewInverse = m_SceneParser.camera.transform;
+        // Extract camera position from transform matrix
+        // HMM column-major: Columns[3] = translation = (m03, m13, m23, m33)
+        HMM_Mat4& camTransform = m_SceneParser.camera.transform;
         
-        m_CameraPosition = float3(viewInverse.m03, viewInverse.m13, viewInverse.m23);
+        m_CameraPosition = HMM_V3(
+            camTransform.Columns[3].X,
+            camTransform.Columns[3].Y,
+            camTransform.Columns[3].Z
+        );
+        
+        // Forward direction: Column[2] is local Z axis in world space
+        // For Mitsuba cameras, this is the view direction
+        HMM_Vec3 forward = HMM_V3(
+            camTransform.Columns[2].X,
+            camTransform.Columns[2].Y,
+            camTransform.Columns[2].Z
+        );
+        
+        m_CameraTarget = HMM_AddV3(m_CameraPosition, forward);
+        
+        // Up vector: Column[1]
+        m_CameraUp = HMM_V3(
+            camTransform.Columns[1].X,
+            camTransform.Columns[1].Y,
+            camTransform.Columns[1].Z
+        );
+        
+        // Calculate initial yaw and pitch from forward direction
+        m_CameraPitch = asinf(-forward.Y);
+        m_CameraYaw = atan2f(forward.X, forward.Z);
         
         // Initialize camera constants
         m_CameraConstants.samplesPerPixel = 1;
         m_CameraConstants.maxBounces = 8;
+        
+        log::info("Camera position: (%.2f, %.2f, %.2f)", m_CameraPosition.X, m_CameraPosition.Y, m_CameraPosition.Z);
+        log::info("Camera forward: (%.2f, %.2f, %.2f)", forward.X, forward.Y, forward.Z);
+    }
+
+    bool KeyboardUpdate(int key, int scancode, int action, int mods) override
+    {
+        bool pressed = (action == 1 || action == 2);  // GLFW_PRESS or GLFW_REPEAT
+        
+        switch (key)
+        {
+            case 'W': m_KeyW = pressed; break;
+            case 'S': m_KeyS = pressed; break;
+            case 'A': m_KeyA = pressed; break;
+            case 'D': m_KeyD = pressed; break;
+            case 'Q': m_KeyQ = pressed; break;
+            case 'E': m_KeyE = pressed; break;
+        }
+        return true;
+    }
+
+    bool MousePosUpdate(double xpos, double ypos) override
+    {
+        float dx = float(xpos) - m_LastMouseX;
+        float dy = float(ypos) - m_LastMouseY;
+        m_LastMouseX = float(xpos);
+        m_LastMouseY = float(ypos);
+        
+        if (m_MouseDown)
+        {
+            float sensitivity = 0.003f;
+            m_CameraYaw += dx * sensitivity;
+            m_CameraPitch -= dy * sensitivity;
+            
+            // Clamp pitch to avoid gimbal lock
+            float maxPitch = HMM_PI32 / 2.0f - 0.01f;
+            if (m_CameraPitch > maxPitch) m_CameraPitch = maxPitch;
+            if (m_CameraPitch < -maxPitch) m_CameraPitch = -maxPitch;
+            
+            // Reset accumulation when camera moves
+            m_FrameIndex = 0;
+        }
+        return true;
+    }
+
+    bool MouseButtonUpdate(int button, int action, int mods) override
+    {
+        if (button == 1)  // Right mouse button
+        {
+            m_MouseDown = (action == 1);  // GLFW_PRESS
+        }
+        return true;
     }
 
     void Animate(float fElapsedTimeSeconds) override
     {
+        // Calculate forward and right vectors from yaw/pitch
+        HMM_Vec3 forward = HMM_V3(
+            sinf(m_CameraYaw) * cosf(m_CameraPitch),
+            sinf(m_CameraPitch),
+            cosf(m_CameraYaw) * cosf(m_CameraPitch)
+        );
+        HMM_Vec3 right = HMM_NormV3(HMM_Cross(forward, HMM_V3(0.0f, 1.0f, 0.0f)));
+        HMM_Vec3 up = HMM_V3(0.0f, 1.0f, 0.0f);
+        
+        // Movement
+        bool moved = false;
+        float speed = m_CameraSpeed * fElapsedTimeSeconds;
+        if (m_KeyW) { m_CameraPosition = HMM_AddV3(m_CameraPosition, HMM_MulV3F(forward, speed)); moved = true; }
+        if (m_KeyS) { m_CameraPosition = HMM_AddV3(m_CameraPosition, HMM_MulV3F(forward, -speed)); moved = true; }
+        if (m_KeyA) { m_CameraPosition = HMM_AddV3(m_CameraPosition, HMM_MulV3F(right, -speed)); moved = true; }
+        if (m_KeyD) { m_CameraPosition = HMM_AddV3(m_CameraPosition, HMM_MulV3F(right, speed)); moved = true; }
+        if (m_KeyE) { m_CameraPosition = HMM_AddV3(m_CameraPosition, HMM_MulV3F(up, speed)); moved = true; }
+        if (m_KeyQ) { m_CameraPosition = HMM_AddV3(m_CameraPosition, HMM_MulV3F(up, -speed)); moved = true; }
+        
+        // Reset accumulation when camera moves
+        if (moved)
+        {
+            m_FrameIndex = 0;
+        }
+        
+        m_CameraTarget = HMM_AddV3(m_CameraPosition, forward);
+        
         GetDeviceManager()->SetInformativeWindowTitle(g_WindowTitle);
     }
 
@@ -1061,17 +1221,45 @@ public:
             m_BindingSet = GetDevice()->createBindingSet(bindingSetDesc, m_BindingLayout);
         }
 
-        // Update camera constants
+        // Update camera constants using HMM
         float aspect = float(fbinfo.width) / float(fbinfo.height);
-        float fovRadians = m_SceneParser.camera.fov * (3.14159265f / 180.0f);
+        
+        // Mitsuba uses horizontal FOV by default, convert to vertical FOV
+        float horizontalFovRadians = m_SceneParser.camera.fov * (HMM_PI32 / 180.0f);
+        float verticalFovRadians = 2.0f * atanf(tanf(horizontalFovRadians * 0.5f) / aspect);
 
-        float4x4 proj = perspProjD3DStyleReverse(fovRadians, aspect, 0.1f);
-        float4x4 view = m_SceneParser.camera.transform;
+        // Use RH perspective with [0,1] depth (matches Mitsuba's RH convention)
+        HMM_Mat4 proj = HMM_Perspective_RH_ZO(verticalFovRadians, aspect, 0.1f, 10000.0f);
+        HMM_Mat4 projInverse = HMM_InvPerspective_RH(proj);
+        
+        // Compute view matrix from current camera position/target, then invert
+        // This updates dynamically when camera moves (unlike using scene's initial transform)
+        HMM_Mat4 view = HMM_LookAt_RH(m_CameraPosition, m_CameraTarget, HMM_V3(0.0f, 1.0f, 0.0f));
+        HMM_Mat4 viewInverse = HMM_InvGeneralM4(view);
 
-        m_CameraConstants.viewInverse = view;
-        m_CameraConstants.projInverse = inverse(proj);
-        m_CameraConstants.cameraPosition = float3(view.m03, view.m13, view.m23);
+        // Copy matrices to GPU format
+        memcpy(m_CameraConstants.viewInverse, &viewInverse, sizeof(float) * 16);
+        memcpy(m_CameraConstants.projInverse, &projInverse, sizeof(float) * 16);
+        m_CameraConstants.cameraPosition[0] = m_CameraPosition.X;
+        m_CameraConstants.cameraPosition[1] = m_CameraPosition.Y;
+        m_CameraConstants.cameraPosition[2] = m_CameraPosition.Z;
         m_CameraConstants.frameIndex = m_FrameIndex;
+
+        // Debug: print first frame info
+        static bool firstFrame = true;
+        if (firstFrame)
+        {
+            log::info("=== RT DEBUG (HMM) ===");
+            log::info("Camera pos: (%.2f, %.2f, %.2f)", m_CameraPosition.X, m_CameraPosition.Y, m_CameraPosition.Z);
+            log::info("Camera target: (%.2f, %.2f, %.2f)", m_CameraTarget.X, m_CameraTarget.Y, m_CameraTarget.Z);
+            log::info("viewInverse col0: %.3f %.3f %.3f %.3f", 
+                viewInverse.Columns[0].X, viewInverse.Columns[0].Y, viewInverse.Columns[0].Z, viewInverse.Columns[0].W);
+            log::info("viewInverse col2: %.3f %.3f %.3f %.3f", 
+                viewInverse.Columns[2].X, viewInverse.Columns[2].Y, viewInverse.Columns[2].Z, viewInverse.Columns[2].W);
+            log::info("viewInverse col3 (pos): %.3f %.3f %.3f %.3f", 
+                viewInverse.Columns[3].X, viewInverse.Columns[3].Y, viewInverse.Columns[3].Z, viewInverse.Columns[3].W);
+            firstFrame = false;
+        }
 
         m_CommandList->open();
 
@@ -1108,6 +1296,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 int main(int __argc, const char** __argv)
 #endif
 {
+    // Enable console output for logging on Windows
+    log::EnableOutputToConsole(true);
+    
     nvrhi::GraphicsAPI api = app::GetGraphicsAPIFromCommandLine(__argc, __argv);
     app::DeviceManager* deviceManager = app::DeviceManager::Create(api);
 

@@ -349,14 +349,17 @@ float3 GetInterpolatedNormal(uint instanceID, uint primitiveIndex, float2 baryce
 {
     GPUInstance instance = Instances[instanceID];
     
+    // Get triangle vertex indices (global indices into vertex buffer)
     uint i0 = Indices[instance.indexOffset + primitiveIndex * 3 + 0];
     uint i1 = Indices[instance.indexOffset + primitiveIndex * 3 + 1];
     uint i2 = Indices[instance.indexOffset + primitiveIndex * 3 + 2];
     
+    // Fetch vertex normals
     float3 n0 = Vertices[i0].normal;
     float3 n1 = Vertices[i1].normal;
     float3 n2 = Vertices[i2].normal;
     
+    // Barycentric interpolation
     float3 normal = n0 * (1.0f - barycentrics.x - barycentrics.y) +
                     n1 * barycentrics.x +
                     n2 * barycentrics.y;
@@ -389,6 +392,7 @@ void RayGen()
     ndc.y = -ndc.y;
     
     float4 rayClip = float4(ndc, 1.0f, 1.0f);
+    // Use column-vector multiplication (M * v) - matrices are stored column-major
     float4 rayView = mul(Camera.projInverse, rayClip);
     rayView /= rayView.w;
     
