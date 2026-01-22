@@ -10,6 +10,14 @@
 #include <nvrhi/utils.h>
 #include <imgui.h>
 
+// DLSS support
+#if DONUT_WITH_DLSS
+#include <donut/render/DLSS.h>
+#include <donut/engine/View.h>
+#include <donut/core/math/math.h>
+namespace dm = donut::math;
+#endif
+
 #include <pugixml.hpp>
 
 #define HANDMADE_MATH_USE_RADIANS
@@ -973,6 +981,21 @@ private:
     nvrhi::TextureHandle m_RenderTarget;
     nvrhi::TextureHandle m_AccumulationTarget;
     
+    // G-buffer textures for DLSS Ray Reconstruction
+    nvrhi::TextureHandle m_DepthBuffer;
+    nvrhi::TextureHandle m_MotionVectors;
+    nvrhi::TextureHandle m_DiffuseAlbedo;
+    nvrhi::TextureHandle m_SpecularAlbedo;
+    nvrhi::TextureHandle m_NormalRoughness;
+    nvrhi::TextureHandle m_DLSSOutput;
+    
+#if DONUT_WITH_DLSS
+    // DLSS
+    std::unique_ptr<render::DLSS> m_DLSS;
+    bool m_DLSSEnabled = false;
+    bool m_DLSSAvailable = false;
+#endif
+    
     // Textures
     nvrhi::TextureHandle m_EnvironmentMap;
     nvrhi::TextureHandle m_DefaultMaterialTexture;  // 1x1 white texture for empty slots
@@ -1020,6 +1043,11 @@ public:
     uint32_t& GetMaxBounces() { return m_CameraConstants.maxBounces; }
     uint32_t GetFrameIndex() const { return m_FrameIndex; }
     void ResetAccumulation() { m_FrameIndex = 0; }
+    
+#if DONUT_WITH_DLSS
+    bool& GetDLSSEnabled() { return m_DLSSEnabled; }
+    bool IsDLSSAvailable() const { return m_DLSSAvailable; }
+#endif
     
 private:
 
@@ -1089,6 +1117,11 @@ public:
             nvrhi::BindingLayoutItem::Texture_SRV(6).setSize(MAX_MATERIAL_TEXTURES),  // t6-t69: Material textures array
             nvrhi::BindingLayoutItem::Texture_UAV(0),               // u0: Output
             nvrhi::BindingLayoutItem::Texture_UAV(1),               // u1: Accumulation
+            nvrhi::BindingLayoutItem::Texture_UAV(2),               // u2: Depth buffer (for DLSS)
+            nvrhi::BindingLayoutItem::Texture_UAV(3),               // u3: Motion vectors (for DLSS)
+            nvrhi::BindingLayoutItem::Texture_UAV(4),               // u4: Diffuse albedo (for DLSS RR)
+            nvrhi::BindingLayoutItem::Texture_UAV(5),               // u5: Specular albedo (for DLSS RR)
+            nvrhi::BindingLayoutItem::Texture_UAV(6),               // u6: Normal + Roughness (for DLSS RR)
             nvrhi::BindingLayoutItem::ConstantBuffer(0),            // b0: Camera
             nvrhi::BindingLayoutItem::Sampler(0)                    // s0: Linear sampler
         };
@@ -1144,6 +1177,34 @@ public:
 
         // Setup camera from scene
         SetupCameraFromScene();
+
+#if DONUT_WITH_DLSS
+        // Initialize DLSS
+        m_DLSS = render::DLSS::Create(GetDevice(), *shaderFactory, 
+            app::GetDirectoryWithExecutable().string(), render::DLSS::DefaultApplicationID);
+        
+        if (m_DLSS)
+        {
+            m_DLSSAvailable = m_DLSS->IsRayReconstructionSupported();
+            if (m_DLSSAvailable)
+            {
+                log::info("DLSS Ray Reconstruction is available");
+            }
+            else if (m_DLSS->IsDlssSupported())
+            {
+                log::info("DLSS is available (but Ray Reconstruction is not)");
+                m_DLSSAvailable = true;  // Can still use regular DLSS
+            }
+            else
+            {
+                log::warning("DLSS is not available on this system");
+            }
+        }
+        else
+        {
+            log::warning("Failed to create DLSS instance");
+        }
+#endif
 
         return true;
     }
@@ -1862,8 +1923,22 @@ public:
     {
         m_RenderTarget = nullptr;
         m_AccumulationTarget = nullptr;
+        m_DepthBuffer = nullptr;
+        m_MotionVectors = nullptr;
+        m_DiffuseAlbedo = nullptr;
+        m_SpecularAlbedo = nullptr;
+        m_NormalRoughness = nullptr;
+        m_DLSSOutput = nullptr;
         m_BindingCache->Clear();
         m_FrameIndex = 0;
+        
+#if DONUT_WITH_DLSS
+        // Re-initialize DLSS on resize
+        if (m_DLSS && m_DLSS->IsDlssInitialized())
+        {
+            // DLSS will be re-initialized on next frame
+        }
+#endif
     }
 
     void Render(nvrhi::IFramebuffer* framebuffer) override
@@ -1885,6 +1960,47 @@ public:
 
             textureDesc.debugName = "AccumulationTarget";
             m_AccumulationTarget = GetDevice()->createTexture(textureDesc);
+            
+            // Create G-buffer textures for DLSS Ray Reconstruction
+            textureDesc.format = nvrhi::Format::R32_FLOAT;
+            textureDesc.debugName = "DepthBuffer";
+            m_DepthBuffer = GetDevice()->createTexture(textureDesc);
+            
+            textureDesc.format = nvrhi::Format::RG16_FLOAT;
+            textureDesc.debugName = "MotionVectors";
+            m_MotionVectors = GetDevice()->createTexture(textureDesc);
+            
+            textureDesc.format = nvrhi::Format::RGBA16_FLOAT;
+            textureDesc.debugName = "DiffuseAlbedo";
+            m_DiffuseAlbedo = GetDevice()->createTexture(textureDesc);
+            
+            textureDesc.debugName = "SpecularAlbedo";
+            m_SpecularAlbedo = GetDevice()->createTexture(textureDesc);
+            
+            textureDesc.debugName = "NormalRoughness";
+            m_NormalRoughness = GetDevice()->createTexture(textureDesc);
+            
+            // DLSS output texture (same format as render target)
+            textureDesc.format = nvrhi::Format::RGBA16_FLOAT;
+            textureDesc.isUAV = false;
+            textureDesc.initialState = nvrhi::ResourceStates::ShaderResource;
+            textureDesc.debugName = "DLSSOutput";
+            m_DLSSOutput = GetDevice()->createTexture(textureDesc);
+
+#if DONUT_WITH_DLSS
+            // Initialize DLSS with current resolution
+            if (m_DLSS && m_DLSSAvailable)
+            {
+                render::DLSS::InitParameters dlssParams;
+                dlssParams.inputWidth = fbinfo.width;
+                dlssParams.inputHeight = fbinfo.height;
+                dlssParams.outputWidth = fbinfo.width;
+                dlssParams.outputHeight = fbinfo.height;
+                dlssParams.useRayReconstruction = m_DLSS->IsRayReconstructionSupported();
+                dlssParams.useAutoExposure = true;
+                m_DLSS->Init(dlssParams);
+            }
+#endif
 
             // Create binding set
             nvrhi::BindingSetDesc bindingSetDesc;
@@ -1897,6 +2013,11 @@ public:
                 nvrhi::BindingSetItem::Texture_SRV(5, m_EnvironmentMap),
                 nvrhi::BindingSetItem::Texture_UAV(0, m_RenderTarget),
                 nvrhi::BindingSetItem::Texture_UAV(1, m_AccumulationTarget),
+                nvrhi::BindingSetItem::Texture_UAV(2, m_DepthBuffer),
+                nvrhi::BindingSetItem::Texture_UAV(3, m_MotionVectors),
+                nvrhi::BindingSetItem::Texture_UAV(4, m_DiffuseAlbedo),
+                nvrhi::BindingSetItem::Texture_UAV(5, m_SpecularAlbedo),
+                nvrhi::BindingSetItem::Texture_UAV(6, m_NormalRoughness),
                 nvrhi::BindingSetItem::ConstantBuffer(0, m_CameraBuffer),
                 nvrhi::BindingSetItem::Sampler(0, m_LinearSampler)
             };
@@ -1976,8 +2097,63 @@ public:
         args.height = fbinfo.height;
         m_CommandList->dispatchRays(args);
 
+        // Choose output texture based on DLSS state
+        nvrhi::TextureHandle outputTexture = m_RenderTarget;
+
+#if DONUT_WITH_DLSS
+        // Apply DLSS if enabled and available
+        if (m_DLSSEnabled && m_DLSS && m_DLSS->IsDlssInitialized())
+        {
+            // Create a simple PlanarView for DLSS
+            engine::PlanarView planarView;
+            planarView.SetViewport(nvrhi::Viewport(float(fbinfo.width), float(fbinfo.height)));
+            
+            // Convert HMM view matrix to donut affine3
+            // HMM matrices are column-major, affine3 needs 3x3 linear + translation
+            dm::float3 col0(view.Columns[0].X, view.Columns[0].Y, view.Columns[0].Z);
+            dm::float3 col1(view.Columns[1].X, view.Columns[1].Y, view.Columns[1].Z);
+            dm::float3 col2(view.Columns[2].X, view.Columns[2].Y, view.Columns[2].Z);
+            dm::float3 translation(view.Columns[3].X, view.Columns[3].Y, view.Columns[3].Z);
+            dm::affine3 viewAffine = dm::affine3::from_cols(col0, col1, col2, translation);
+            
+            // Convert projection matrix
+            dm::float4x4 projMatrix;
+            memcpy(&projMatrix, &proj, sizeof(float) * 16);
+            planarView.SetMatrices(viewAffine, projMatrix);
+            
+            render::DLSS::EvaluateParameters dlssParams;
+            dlssParams.depthTexture = m_DepthBuffer;
+            dlssParams.motionVectorsTexture = m_MotionVectors;
+            dlssParams.inputColorTexture = m_RenderTarget;
+            dlssParams.outputColorTexture = m_DLSSOutput;
+            dlssParams.resetHistory = (m_FrameIndex == 0);
+            
+            // DLSS RR specific textures
+            if (m_DLSS->IsRayReconstructionSupported())
+            {
+                dlssParams.diffuseAlbedo = m_DiffuseAlbedo;
+                dlssParams.specularAlbedo = m_SpecularAlbedo;
+                dlssParams.normalRoughness = m_NormalRoughness;
+            }
+            
+            m_CommandList->close();
+            GetDevice()->executeCommandList(m_CommandList);
+            
+            // DLSS needs its own command list execution
+            nvrhi::CommandListHandle dlssCommandList = GetDevice()->createCommandList();
+            dlssCommandList->open();
+            m_DLSS->Evaluate(dlssCommandList, dlssParams, planarView);
+            dlssCommandList->close();
+            GetDevice()->executeCommandList(dlssCommandList);
+            
+            // Re-open for blit
+            m_CommandList->open();
+            outputTexture = m_DLSSOutput;
+        }
+#endif
+
         // Blit to framebuffer
-        m_CommonPasses->BlitTexture(m_CommandList, framebuffer, m_RenderTarget, m_BindingCache.get());
+        m_CommonPasses->BlitTexture(m_CommandList, framebuffer, outputTexture, m_BindingCache.get());
 
         m_CommandList->close();
         GetDevice()->executeCommandList(m_CommandList);
@@ -2008,12 +2184,34 @@ protected:
             return;
             
         ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(300, 200), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(300, 280), ImGuiCond_FirstUseEver);
         
         if (ImGui::Begin("Render Settings"))
         {
             ImGui::Text("Frame: %u", m_pScene->GetFrameIndex());
             ImGui::Separator();
+            
+#if DONUT_WITH_DLSS
+            // DLSS controls
+            if (m_pScene->IsDLSSAvailable())
+            {
+                bool dlssEnabled = m_pScene->GetDLSSEnabled();
+                if (ImGui::Checkbox("DLSS Ray Reconstruction", &dlssEnabled))
+                {
+                    m_pScene->GetDLSSEnabled() = dlssEnabled;
+                    m_pScene->ResetAccumulation();
+                }
+                if (ImGui::IsItemHovered())
+                {
+                    ImGui::SetTooltip("Enable NVIDIA DLSS Ray Reconstruction for denoising");
+                }
+            }
+            else
+            {
+                ImGui::TextDisabled("DLSS not available");
+            }
+            ImGui::Separator();
+#endif
             
             // Exposure control
             float exposure = m_pScene->GetExposure();

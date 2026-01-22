@@ -113,6 +113,13 @@ Texture2D<float4> MaterialTextures[64]         : register(t6);
 RWTexture2D<float4> OutputTexture              : register(u0);
 RWTexture2D<float4> AccumulationTexture        : register(u1);
 
+// G-buffer outputs for DLSS Ray Reconstruction
+RWTexture2D<float> DepthBuffer                 : register(u2);
+RWTexture2D<float2> MotionVectors              : register(u3);
+RWTexture2D<float4> DiffuseAlbedo              : register(u4);
+RWTexture2D<float4> SpecularAlbedo             : register(u5);
+RWTexture2D<float4> NormalRoughness            : register(u6);
+
 cbuffer CameraBuffer : register(b0)
 {
     CameraConstants Camera;
@@ -412,6 +419,14 @@ void RayGen()
     float3 radiance = float3(0.0f, 0.0f, 0.0f);
     float3 throughput = float3(1.0f, 1.0f, 1.0f);
     
+    // G-buffer data for DLSS RR (captured at first hit)
+    float firstHitDepth = 10000.0f;
+    float3 firstHitNormal = float3(0.0f, 1.0f, 0.0f);
+    float firstHitRoughness = 1.0f;
+    float3 firstHitDiffuseAlbedo = float3(0.0f, 0.0f, 0.0f);
+    float3 firstHitSpecularAlbedo = float3(0.0f, 0.0f, 0.0f);
+    bool firstHitCaptured = false;
+    
     RayDesc ray;
     ray.Origin = rayOrigin;
     ray.Direction = rayDir;
@@ -469,6 +484,39 @@ void RayGen()
         
         // Apply normal map to get shading normal
         float3 normal = GetShadingNormal(geometricNormal, mat, payload.texcoord);
+        
+        // Capture G-buffer data on first hit for DLSS RR
+        if (!firstHitCaptured)
+        {
+            firstHitDepth = payload.hitT;
+            firstHitNormal = normal;
+            firstHitRoughness = mat.roughness;
+            
+            // Compute diffuse and specular albedo based on material type
+            MaterialParams matParams = GPUMaterialToParams(mat);
+            if (matParams.type == MATERIAL_CONDUCTOR || matParams.type == MATERIAL_ROUGH_CONDUCTOR)
+            {
+                // Metal: no diffuse, colored specular
+                firstHitDiffuseAlbedo = float3(0.0f, 0.0f, 0.0f);
+                firstHitSpecularAlbedo = matParams.baseColor;
+            }
+            else if (matParams.type == MATERIAL_DIELECTRIC || matParams.type == MATERIAL_ROUGH_DIELECTRIC ||
+                     matParams.type == MATERIAL_THIN_DIELECTRIC)
+            {
+                // Dielectric: white specular
+                firstHitDiffuseAlbedo = float3(0.0f, 0.0f, 0.0f);
+                firstHitSpecularAlbedo = float3(1.0f, 1.0f, 1.0f);
+            }
+            else
+            {
+                // Diffuse, plastic, principled: colored diffuse, white or tinted specular
+                firstHitDiffuseAlbedo = matParams.baseColor;
+                float3 specColor = lerp(float3(1.0f, 1.0f, 1.0f), matParams.baseColor, matParams.metallic);
+                firstHitSpecularAlbedo = specColor;
+            }
+            
+            firstHitCaptured = true;
+        }
         
         // Make sure normal faces the ray
         if (dot(normal, ray.Direction) > 0.0f)
@@ -578,6 +626,23 @@ void RayGen()
     finalColor = pow(finalColor, 1.0f / 2.2f);
     
     OutputTexture[launchIndex] = float4(finalColor, 1.0f);
+    
+    // Output G-buffer data for DLSS Ray Reconstruction
+    // Depth: linear view-space depth
+    DepthBuffer[launchIndex] = firstHitDepth;
+    
+    // Motion vectors: zero for now (would need previous frame view matrix for proper calculation)
+    MotionVectors[launchIndex] = float2(0.0f, 0.0f);
+    
+    // Diffuse albedo: base color for diffuse surfaces
+    DiffuseAlbedo[launchIndex] = float4(firstHitDiffuseAlbedo, 1.0f);
+    
+    // Specular albedo: F0 reflectance
+    SpecularAlbedo[launchIndex] = float4(firstHitSpecularAlbedo, 1.0f);
+    
+    // Normal + Roughness: packed (normal.xyz, roughness)
+    // Normal is in world space, range [-1, 1], we store as is
+    NormalRoughness[launchIndex] = float4(firstHitNormal * 0.5f + 0.5f, firstHitRoughness);
 }
 
 // ============================================================================

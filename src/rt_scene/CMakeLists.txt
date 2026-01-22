@@ -16,9 +16,14 @@ donut_compile_shaders(
 )
 
 add_executable(${project} WIN32 ${sources})
-target_link_libraries(${project} donut_app donut_engine pugixml tinyobj hmm)
+target_link_libraries(${project} donut_app donut_engine donut_render pugixml tinyobj hmm)
 add_dependencies(${project} ${project}_shaders)
 set_target_properties(${project} PROPERTIES FOLDER ${folder})
+
+# Link DLSS if available
+if(TARGET DLSS)
+    target_link_libraries(${project} DLSS)
+endif()
 
 # Include paths for stb_image and tinyexr
 target_include_directories(${project} PRIVATE 
