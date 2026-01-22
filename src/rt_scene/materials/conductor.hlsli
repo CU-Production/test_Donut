@@ -1,17 +1,32 @@
 // ============================================================================
-// conductor.hlsli - Conductor (Metal) BRDF
+// conductor.hlsli - Conductor (Metal) BRDF (Mitsuba3 compatible)
 // 
 // Implements both smooth (perfect mirror) and rough conductor materials
 // using the GGX microfacet model with conductor Fresnel.
+//
+// Reference: https://mitsuba.readthedocs.io/en/stable/src/generated/plugins_bsdfs.html
 // ============================================================================
 #ifndef MATERIALS_CONDUCTOR_HLSLI
 #define MATERIALS_CONDUCTOR_HLSLI
 
 #include "common.hlsli"
+#include "conductor_ior.hlsli"
 
 // ============================================================================
-// Smooth Conductor (Perfect Mirror)
+// Smooth Conductor (Perfect Mirror) - Mitsuba3 compatible
 // ============================================================================
+
+// Check if this is a "none" material (perfect mirror with 100% reflectance)
+bool IsPerfectMirror(float3 eta, float3 k)
+{
+    // In Mitsuba, material="none" means 100% reflective mirror
+    // We detect this by checking if eta is close to 0 or 1 and k is non-zero
+    // Our convention: eta=(0,0,0) or eta=(1,1,1) with default k means perfect mirror
+    bool etaIsDefault = (all(eta < 0.01f)) || 
+                        (abs(eta.x - 1.0f) < 0.01f && abs(eta.y - 1.0f) < 0.01f && abs(eta.z - 1.0f) < 0.01f);
+    bool kIsDefault = all(abs(k) < 0.01f) || all(abs(k - 1.0f) < 0.01f);
+    return etaIsDefault && kIsDefault;
+}
 
 // Evaluate smooth conductor - returns 0 since it's a delta distribution
 float3 SmoothConductor_Evaluate(float3 eta, float3 k, float3 wo, float3 wi, float3 normal)
@@ -20,20 +35,35 @@ float3 SmoothConductor_Evaluate(float3 eta, float3 k, float3 wo, float3 wi, floa
     return float3(0.0f, 0.0f, 0.0f);
 }
 
-// Sample smooth conductor - perfect mirror reflection
-float3 SmoothConductor_Sample(float3 eta, float3 k, float3 wo, float3 normal, out float3 throughputWeight, out float pdf)
+// Sample smooth conductor - perfect mirror reflection (Mitsuba3 compatible)
+float3 SmoothConductor_Sample(float3 eta, float3 k, float3 specularReflectance, float3 wo, float3 normal, out float3 throughputWeight, out float pdf)
 {
     float3 wi = reflect(-wo, normal);
     
-    float cosTheta = abs(dot(wo, normal));
-    float3 F = FresnelConductor(cosTheta, eta, k);
-    
     // For delta distributions, pdf is conceptually infinite, but we set to 1
-    // and include the full reflectance in the throughput weight
     pdf = 1.0f;
-    throughputWeight = F;
+    
+    // Check for perfect mirror (material="none" in Mitsuba)
+    if (IsPerfectMirror(eta, k))
+    {
+        // 100% reflective mirror - use specular_reflectance as the color
+        throughputWeight = specularReflectance;
+    }
+    else
+    {
+        // Real conductor with complex IOR
+        float cosTheta = abs(dot(wo, normal));
+        float3 F = FresnelConductor(cosTheta, eta, k);
+        throughputWeight = F * specularReflectance;
+    }
     
     return wi;
+}
+
+// Legacy overload for compatibility
+float3 SmoothConductor_Sample(float3 eta, float3 k, float3 wo, float3 normal, out float3 throughputWeight, out float pdf)
+{
+    return SmoothConductor_Sample(eta, k, float3(1.0f, 1.0f, 1.0f), wo, normal, throughputWeight, pdf);
 }
 
 // ============================================================================

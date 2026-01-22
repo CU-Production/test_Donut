@@ -12,6 +12,10 @@
 #include "conductor.hlsli"
 #include "dielectric.hlsli"
 #include "plastic.hlsli"
+#include "thindielectric.hlsli"
+#include "principled.hlsli"
+#include "modifiers.hlsli"
+#include "normalmap.hlsli"
 
 // ============================================================================
 // Material Type Constants
@@ -23,6 +27,11 @@ static const uint MATERIAL_DIELECTRIC = 3;
 static const uint MATERIAL_ROUGH_DIELECTRIC = 4;
 static const uint MATERIAL_PLASTIC = 5;
 static const uint MATERIAL_ROUGH_PLASTIC = 6;
+static const uint MATERIAL_THIN_DIELECTRIC = 7;
+static const uint MATERIAL_PRINCIPLED = 8;
+static const uint MATERIAL_BLEND = 9;
+static const uint MATERIAL_MASK = 10;
+static const uint MATERIAL_NULL = 11;
 
 // ============================================================================
 // Material Structure
@@ -40,7 +49,39 @@ struct MaterialParams
     
     float intIOR;          // Interior IOR (for dielectrics/plastics)
     float extIOR;          // Exterior IOR (for dielectrics/plastics)
+    
+    // Principled BSDF parameters
+    float specular;        // Specular intensity (F0 = 0.08 * specular for dielectrics)
+    float specTint;        // Tint specular towards base color
+    float sheen;           // Sheen intensity
+    float sheenTint;       // Tint sheen towards base color
+    float clearcoat;       // Clearcoat intensity
+    float clearcoatGloss;  // Clearcoat glossiness
+    float specTrans;       // Specular transmission (glass-like)
+    
+    // Mask/Blend parameters
+    float opacity;         // Opacity for mask material [0, 1]
+    float blendWeight;     // Blend weight for blendbsdf [0, 1]
 };
+
+// Convert MaterialParams to PrincipledParams
+PrincipledParams MaterialToPrincipled(MaterialParams mat)
+{
+    PrincipledParams p;
+    p.baseColor = mat.baseColor;
+    p.roughness = mat.roughness;
+    p.metallic = mat.metallic;
+    p.specular = mat.specular;
+    p.specTint = mat.specTint;
+    p.anisotropic = 0.0f;  // Not yet supported in GPU struct
+    p.sheen = mat.sheen;
+    p.sheenTint = mat.sheenTint;
+    p.clearcoat = mat.clearcoat;
+    p.clearcoatGloss = mat.clearcoatGloss;
+    p.specTrans = mat.specTrans;
+    p.eta = mat.intIOR / mat.extIOR;
+    return p;
+}
 
 // ============================================================================
 // Unified Evaluation Function
@@ -60,11 +101,21 @@ float3 Material_Evaluate(MaterialParams mat, float3 wo, float3 wi, float3 normal
             
         case MATERIAL_CONDUCTOR:
         case MATERIAL_ROUGH_CONDUCTOR:
-            // Use complex IOR if available, otherwise use baseColor as F0
-            if (any(mat.eta > 0.0f) || any(mat.k > 0.0f))
-                return Conductor_Evaluate(mat.eta, mat.k, mat.roughness, wo, wi, normal);
-            else
+        {
+            // Check if this is a perfect mirror (material="none")
+            bool isPerfectMirror = IsPerfectMirror(mat.eta, mat.k);
+            
+            if (isPerfectMirror)
+            {
+                // Perfect mirror - use Schlick with baseColor
                 return ConductorSchlick_Evaluate(mat.baseColor, mat.roughness, wo, wi, normal);
+            }
+            else
+            {
+                // Real conductor with complex IOR
+                return Conductor_Evaluate(mat.eta, mat.k, mat.roughness, wo, wi, normal);
+            }
+        }
             
         case MATERIAL_DIELECTRIC:
         case MATERIAL_ROUGH_DIELECTRIC:
@@ -73,6 +124,23 @@ float3 Material_Evaluate(MaterialParams mat, float3 wo, float3 wi, float3 normal
         case MATERIAL_PLASTIC:
         case MATERIAL_ROUGH_PLASTIC:
             return Plastic_Evaluate(mat.baseColor, mat.roughness, mat.intIOR, mat.extIOR, wo, wi, normal);
+        
+        case MATERIAL_THIN_DIELECTRIC:
+            return ThinDielectric_Evaluate(mat.intIOR, mat.extIOR, wo, wi, normal);
+        
+        case MATERIAL_PRINCIPLED:
+        {
+            PrincipledParams p = MaterialToPrincipled(mat);
+            return Principled_Evaluate(p, wo, wi, normal);
+        }
+        
+        case MATERIAL_NULL:
+            return Null_Evaluate(wo, wi, normal);
+        
+        case MATERIAL_MASK:
+            // Mask evaluation depends on the base material
+            // For now, treat as diffuse
+            return mat.opacity * Diffuse_Evaluate(mat.baseColor, wo, wi, normal);
             
         default:
             return Diffuse_Evaluate(mat.baseColor, wo, wi, normal);
@@ -107,17 +175,56 @@ float3 Material_Sample(MaterialParams mat, float3 wo, float3 normal, float2 u,
         case MATERIAL_CONDUCTOR:
         case MATERIAL_ROUGH_CONDUCTOR:
         {
-            float3 eta = mat.eta;
-            float3 k = mat.k;
+            // Check if this is a perfect mirror (material="none" in Mitsuba)
+            // Detect by checking if eta and k are both zero or default values
+            bool isPerfectMirror = IsPerfectMirror(mat.eta, mat.k);
+            bool isSmooth = (mat.roughness < 0.01f);
             
-            // If no complex IOR provided, derive from baseColor
-            if (!any(eta > 0.0f) && !any(k > 0.0f))
+            if (isPerfectMirror)
             {
-                eta = mat.baseColor;  // Use as F0 approximation
-                k = float3(0.0f, 0.0f, 0.0f);
+                // Perfect mirror - 100% reflective
+                if (isSmooth)
+                {
+                    // Smooth perfect mirror
+                    float3 wi = reflect(-wo, normal);
+                    pdf = 1.0f;
+                    throughputWeight = mat.baseColor;  // Use baseColor as specular_reflectance
+                    return wi;
+                }
+                else
+                {
+                    // Rough perfect mirror - use Schlick with baseColor as F0
+                    float alpha = RoughnessToAlpha(mat.roughness);
+                    float3 h = LocalToWorld(SampleGGX(u, alpha), normal);
+                    float3 wi = reflect(-wo, h);
+                    
+                    float NdotV = dot(normal, wo);
+                    float NdotL = dot(normal, wi);
+                    float NdotH = max(0.0f, dot(normal, h));
+                    float VdotH = max(0.0f, dot(wo, h));
+                    
+                    if (NdotL <= 0.0f)
+                    {
+                        pdf = 0.0f;
+                        throughputWeight = float3(0.0f, 0.0f, 0.0f);
+                        return wi;
+                    }
+                    
+                    float D = D_GGX(NdotH, alpha);
+                    float G = G_SmithGGX(NdotV, NdotL, alpha);
+                    // For perfect mirror without complex IOR, use 100% reflectance
+                    float3 F = mat.baseColor;
+                    
+                    pdf = D * NdotH / (4.0f * VdotH + EPSILON);
+                    throughputWeight = F * G * VdotH / (NdotV * NdotH + EPSILON);
+                    return wi;
+                }
             }
-            
-            return Conductor_Sample(eta, k, mat.roughness, wo, normal, u, throughputWeight, pdf);
+            else
+            {
+                // Real conductor with complex IOR - use proper Fresnel
+                return Conductor_Sample(mat.eta, mat.k, mat.roughness, wo, normal, u, throughputWeight, pdf);
+            }
         }
         
         case MATERIAL_DIELECTRIC:
@@ -127,6 +234,53 @@ float3 Material_Sample(MaterialParams mat, float3 wo, float3 normal, float2 u,
         case MATERIAL_PLASTIC:
         case MATERIAL_ROUGH_PLASTIC:
             return Plastic_Sample(mat.baseColor, mat.roughness, mat.intIOR, mat.extIOR, wo, normal, u, throughputWeight, pdf);
+        
+        case MATERIAL_THIN_DIELECTRIC:
+        {
+            bool isTransmitted;
+            float3 wi = ThinDielectric_Sample(mat.intIOR, mat.extIOR, wo, normal, u, throughputWeight, pdf, isTransmitted);
+            isRefracted = isTransmitted;
+            return wi;
+        }
+        
+        case MATERIAL_PRINCIPLED:
+        {
+            PrincipledParams p = MaterialToPrincipled(mat);
+            bool isTransmitted;
+            float3 wi = Principled_Sample(p, wo, normal, u, throughputWeight, pdf, isTransmitted);
+            isRefracted = isTransmitted;
+            return wi;
+        }
+        
+        case MATERIAL_NULL:
+        {
+            float3 wi = Null_Sample(wo, throughputWeight, pdf);
+            isRefracted = true;  // Ray passes through
+            return wi;
+        }
+        
+        case MATERIAL_MASK:
+        {
+            // Decide if ray passes through or interacts with base material
+            if (Mask_ShouldPassThrough(mat.opacity, u.x))
+            {
+                // Pass through (transparent)
+                float3 wi = Mask_PassThrough(wo);
+                pdf = 1.0f - mat.opacity;
+                throughputWeight = float3(1.0f, 1.0f, 1.0f);
+                isRefracted = true;
+                return wi;
+            }
+            else
+            {
+                // Use diffuse as base material
+                float2 u2 = float2(u.x / mat.opacity, u.y);
+                float3 wi = Diffuse_Sample(normal, u2, pdf);
+                pdf *= mat.opacity;
+                throughputWeight = mat.baseColor;
+                return wi;
+            }
+        }
         
         default:
         {

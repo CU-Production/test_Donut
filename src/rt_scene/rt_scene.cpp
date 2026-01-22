@@ -40,7 +40,12 @@ enum class MaterialType : uint32_t
     Dielectric = 3,
     RoughDielectric = 4,
     Plastic = 5,
-    RoughPlastic = 6
+    RoughPlastic = 6,
+    ThinDielectric = 7,
+    Principled = 8,
+    Blend = 9,
+    Mask = 10,
+    Null = 11
 };
 
 // ============================================================================
@@ -63,7 +68,21 @@ struct GPUMaterial
     int32_t roughnessTexIdx;   // -1 if no texture
     
     int32_t normalTexIdx;      // -1 if no texture
-    float padding[3];
+    
+    // Principled BSDF parameters
+    float specular;        // Specular intensity
+    float specTint;        // Tint specular towards base color
+    float sheen;           // Sheen intensity
+    
+    float sheenTint;       // Tint sheen towards base color
+    float clearcoat;       // Clearcoat intensity
+    float clearcoatGloss;  // Clearcoat glossiness
+    float specTrans;       // Specular transmission
+    
+    // Mask/Blend parameters
+    float opacity;         // Opacity for mask material
+    float blendWeight;     // Blend weight for blendbsdf
+    float padding[2];
 };
 
 struct GPUVertex
@@ -130,6 +149,20 @@ public:
         HMM_Vec3 k = HMM_V3(0.0f, 0.0f, 0.0f);
         float intIOR = 1.5f;
         float extIOR = 1.0f;
+        float metallic = 0.0f;
+        
+        // Principled BSDF parameters
+        float specular = 0.5f;
+        float specTint = 0.0f;
+        float sheen = 0.0f;
+        float sheenTint = 0.0f;
+        float clearcoat = 0.0f;
+        float clearcoatGloss = 0.0f;
+        float specTrans = 0.0f;
+        
+        // Mask/Blend parameters
+        float opacity = 1.0f;
+        float blendWeight = 0.5f;
         
         // Texture references
         TextureRef baseColorTexture;
@@ -227,6 +260,21 @@ public:
 
         log::info("Parsed %zu materials, %zu shapes, %zu textures", 
             materials.size(), shapes.size(), loadedTextures.size());
+        
+        // Debug: print material types
+        for (auto& [id, mat] : materials)
+        {
+            const char* typeNames[] = {
+                "Diffuse", "Conductor", "RoughConductor", "Dielectric", "RoughDielectric", 
+                "Plastic", "RoughPlastic", "ThinDielectric", "Principled", "Blend", "Mask", "Null"
+            };
+            uint32_t typeIdx = static_cast<uint32_t>(mat.type);
+            const char* typeName = (typeIdx < 12) ? typeNames[typeIdx] : "Unknown";
+            log::info("  Material '%s': type=%s, roughness=%.2f, baseColor=(%.2f,%.2f,%.2f), texIdx=%d",
+                id.c_str(), typeName, mat.roughness, 
+                mat.baseColor.X, mat.baseColor.Y, mat.baseColor.Z,
+                mat.baseColorTexture.textureIndex);
+        }
         if (environmentMap.isValid)
         {
             log::info("Environment map: %s (intensity: %.2f)", 
@@ -353,6 +401,7 @@ private:
         else if (type == "roughconductor")
         {
             mat.type = MaterialType::RoughConductor;
+            mat.baseColor = HMM_V3(1.0f, 1.0f, 1.0f);  // Default specular reflectance
         }
         else if (type == "dielectric")
         {
@@ -371,6 +420,30 @@ private:
         else if (type == "roughplastic")
         {
             mat.type = MaterialType::RoughPlastic;
+        }
+        else if (type == "thindielectric")
+        {
+            mat.type = MaterialType::ThinDielectric;
+            mat.roughness = 0.0f;
+        }
+        else if (type == "principled")
+        {
+            mat.type = MaterialType::Principled;
+            mat.specular = 0.5f;  // Default specular
+        }
+        else if (type == "blendbsdf")
+        {
+            mat.type = MaterialType::Blend;
+            mat.blendWeight = 0.5f;
+        }
+        else if (type == "mask")
+        {
+            mat.type = MaterialType::Mask;
+            mat.opacity = 0.5f;
+        }
+        else if (type == "null")
+        {
+            mat.type = MaterialType::Null;
         }
 
         // Parse material properties
@@ -398,7 +471,7 @@ private:
             else if (childName == "float")
             {
                 float value = child.attribute("value").as_float();
-                if (propName == "alpha")
+                if (propName == "alpha" || propName == "roughness")
                 {
                     mat.roughness = value;
                 }
@@ -409,6 +482,114 @@ private:
                 else if (propName == "ext_ior")
                 {
                     mat.extIOR = value;
+                }
+                else if (propName == "eta")
+                {
+                    // Scalar eta for dielectrics
+                    mat.intIOR = value;
+                }
+                // Principled BSDF parameters
+                else if (propName == "metallic")
+                {
+                    mat.metallic = value;
+                }
+                else if (propName == "specular")
+                {
+                    mat.specular = value;
+                }
+                else if (propName == "spec_tint")
+                {
+                    mat.specTint = value;
+                }
+                else if (propName == "sheen")
+                {
+                    mat.sheen = value;
+                }
+                else if (propName == "sheen_tint")
+                {
+                    mat.sheenTint = value;
+                }
+                else if (propName == "clearcoat")
+                {
+                    mat.clearcoat = value;
+                }
+                else if (propName == "clearcoat_gloss")
+                {
+                    mat.clearcoatGloss = value;
+                }
+                else if (propName == "spec_trans")
+                {
+                    mat.specTrans = value;
+                }
+                // Mask/Blend parameters
+                else if (propName == "opacity")
+                {
+                    mat.opacity = value;
+                }
+                else if (propName == "weight")
+                {
+                    mat.blendWeight = value;
+                }
+            }
+            else if (childName == "string")
+            {
+                std::string value = child.attribute("value").value();
+                if (propName == "material")
+                {
+                    // Mitsuba conductor material presets
+                    // Reference: https://mitsuba.readthedocs.io/en/stable/src/generated/plugins_bsdfs.html
+                    if (value == "none")
+                    {
+                        // Perfect mirror - 100% reflective
+                        mat.eta = HMM_V3(0.0f, 0.0f, 0.0f);
+                        mat.k = HMM_V3(0.0f, 0.0f, 0.0f);
+                    }
+                    else if (value == "Ag" || value == "silver")
+                    {
+                        mat.eta = HMM_V3(0.155f, 0.117f, 0.138f);
+                        mat.k = HMM_V3(4.827f, 3.122f, 2.147f);
+                    }
+                    else if (value == "Au" || value == "gold")
+                    {
+                        mat.eta = HMM_V3(0.143f, 0.374f, 1.442f);
+                        mat.k = HMM_V3(3.983f, 2.387f, 1.603f);
+                    }
+                    else if (value == "Cu" || value == "copper")
+                    {
+                        mat.eta = HMM_V3(0.200f, 0.924f, 1.102f);
+                        mat.k = HMM_V3(3.912f, 2.452f, 2.142f);
+                    }
+                    else if (value == "Al" || value == "aluminium" || value == "aluminum")
+                    {
+                        mat.eta = HMM_V3(1.657f, 0.880f, 0.521f);
+                        mat.k = HMM_V3(9.224f, 6.269f, 4.837f);
+                    }
+                    else if (value == "Cr" || value == "chromium")
+                    {
+                        mat.eta = HMM_V3(3.180f, 3.180f, 2.010f);
+                        mat.k = HMM_V3(3.300f, 3.330f, 3.040f);
+                    }
+                    else if (value == "Ni" || value == "nickel")
+                    {
+                        mat.eta = HMM_V3(1.970f, 1.860f, 1.670f);
+                        mat.k = HMM_V3(3.740f, 3.060f, 2.580f);
+                    }
+                    else if (value == "Ti" || value == "titanium")
+                    {
+                        mat.eta = HMM_V3(2.160f, 1.970f, 1.810f);
+                        mat.k = HMM_V3(2.930f, 2.620f, 2.350f);
+                    }
+                    else if (value == "W" || value == "tungsten")
+                    {
+                        mat.eta = HMM_V3(4.350f, 3.400f, 2.850f);
+                        mat.k = HMM_V3(3.400f, 2.700f, 2.150f);
+                    }
+                    else if (value == "Fe" || value == "iron")
+                    {
+                        mat.eta = HMM_V3(2.950f, 2.930f, 2.650f);
+                        mat.k = HMM_V3(3.000f, 2.950f, 2.800f);
+                    }
+                    // Add more presets as needed
                 }
             }
             else if (childName == "texture")
@@ -892,7 +1073,7 @@ public:
         // Create materials from parsed scene
         for (auto& [id, mat] : m_SceneParser.materials)
         {
-            GPUMaterial gpuMat;
+            GPUMaterial gpuMat = {};  // Zero-initialize
             gpuMat.baseColor[0] = mat.baseColor.X;
             gpuMat.baseColor[1] = mat.baseColor.Y;
             gpuMat.baseColor[2] = mat.baseColor.Z;
@@ -906,10 +1087,28 @@ public:
             gpuMat.type = static_cast<uint32_t>(mat.type);
             gpuMat.intIOR = mat.intIOR;
             gpuMat.extIOR = mat.extIOR;
-            gpuMat.metallic = (mat.type == MaterialType::Conductor || mat.type == MaterialType::RoughConductor) ? 1.0f : 0.0f;
+            gpuMat.metallic = mat.metallic;
+            if (mat.type == MaterialType::Conductor || mat.type == MaterialType::RoughConductor)
+            {
+                gpuMat.metallic = 1.0f;
+            }
             gpuMat.baseColorTexIdx = mat.baseColorTexture.textureIndex;
             gpuMat.roughnessTexIdx = mat.roughnessTexture.textureIndex;
             gpuMat.normalTexIdx = mat.normalTexture.textureIndex;
+            
+            // Principled BSDF parameters
+            gpuMat.specular = mat.specular;
+            gpuMat.specTint = mat.specTint;
+            gpuMat.sheen = mat.sheen;
+            gpuMat.sheenTint = mat.sheenTint;
+            gpuMat.clearcoat = mat.clearcoat;
+            gpuMat.clearcoatGloss = mat.clearcoatGloss;
+            gpuMat.specTrans = mat.specTrans;
+            
+            // Mask/Blend parameters
+            gpuMat.opacity = mat.opacity;
+            gpuMat.blendWeight = mat.blendWeight;
+            
             m_Materials.push_back(gpuMat);
         }
 
@@ -1047,24 +1246,36 @@ public:
         else if (shape.hasInlineMaterial)
         {
             // Add inline material
-            GPUMaterial gpuMat;
-            gpuMat.baseColor[0] = shape.inlineMaterial.baseColor.X;
-            gpuMat.baseColor[1] = shape.inlineMaterial.baseColor.Y;
-            gpuMat.baseColor[2] = shape.inlineMaterial.baseColor.Z;
-            gpuMat.roughness = shape.inlineMaterial.roughness;
-            gpuMat.eta[0] = shape.inlineMaterial.eta.X;
-            gpuMat.eta[1] = shape.inlineMaterial.eta.Y;
-            gpuMat.eta[2] = shape.inlineMaterial.eta.Z;
-            gpuMat.k[0] = shape.inlineMaterial.k.X;
-            gpuMat.k[1] = shape.inlineMaterial.k.Y;
-            gpuMat.k[2] = shape.inlineMaterial.k.Z;
-            gpuMat.type = static_cast<uint32_t>(shape.inlineMaterial.type);
-            gpuMat.intIOR = shape.inlineMaterial.intIOR;
-            gpuMat.extIOR = shape.inlineMaterial.extIOR;
-            gpuMat.metallic = 0.0f;
-            gpuMat.baseColorTexIdx = shape.inlineMaterial.baseColorTexture.textureIndex;
-            gpuMat.roughnessTexIdx = shape.inlineMaterial.roughnessTexture.textureIndex;
-            gpuMat.normalTexIdx = shape.inlineMaterial.normalTexture.textureIndex;
+            GPUMaterial gpuMat = {};
+            const auto& mat = shape.inlineMaterial;
+            gpuMat.baseColor[0] = mat.baseColor.X;
+            gpuMat.baseColor[1] = mat.baseColor.Y;
+            gpuMat.baseColor[2] = mat.baseColor.Z;
+            gpuMat.roughness = mat.roughness;
+            gpuMat.eta[0] = mat.eta.X;
+            gpuMat.eta[1] = mat.eta.Y;
+            gpuMat.eta[2] = mat.eta.Z;
+            gpuMat.k[0] = mat.k.X;
+            gpuMat.k[1] = mat.k.Y;
+            gpuMat.k[2] = mat.k.Z;
+            gpuMat.type = static_cast<uint32_t>(mat.type);
+            gpuMat.intIOR = mat.intIOR;
+            gpuMat.extIOR = mat.extIOR;
+            gpuMat.metallic = mat.metallic;
+            if (mat.type == MaterialType::Conductor || mat.type == MaterialType::RoughConductor)
+                gpuMat.metallic = 1.0f;
+            gpuMat.baseColorTexIdx = mat.baseColorTexture.textureIndex;
+            gpuMat.roughnessTexIdx = mat.roughnessTexture.textureIndex;
+            gpuMat.normalTexIdx = mat.normalTexture.textureIndex;
+            gpuMat.specular = mat.specular;
+            gpuMat.specTint = mat.specTint;
+            gpuMat.sheen = mat.sheen;
+            gpuMat.sheenTint = mat.sheenTint;
+            gpuMat.clearcoat = mat.clearcoat;
+            gpuMat.clearcoatGloss = mat.clearcoatGloss;
+            gpuMat.specTrans = mat.specTrans;
+            gpuMat.opacity = mat.opacity;
+            gpuMat.blendWeight = mat.blendWeight;
             matIndex = static_cast<uint32_t>(m_Materials.size());
             m_Materials.push_back(gpuMat);
         }
@@ -1141,24 +1352,36 @@ public:
         uint32_t matIndex = 0;
         if (shape.hasInlineMaterial)
         {
-            GPUMaterial gpuMat;
-            gpuMat.baseColor[0] = shape.inlineMaterial.baseColor.X;
-            gpuMat.baseColor[1] = shape.inlineMaterial.baseColor.Y;
-            gpuMat.baseColor[2] = shape.inlineMaterial.baseColor.Z;
-            gpuMat.roughness = shape.inlineMaterial.roughness;
-            gpuMat.eta[0] = shape.inlineMaterial.eta.X;
-            gpuMat.eta[1] = shape.inlineMaterial.eta.Y;
-            gpuMat.eta[2] = shape.inlineMaterial.eta.Z;
-            gpuMat.k[0] = shape.inlineMaterial.k.X;
-            gpuMat.k[1] = shape.inlineMaterial.k.Y;
-            gpuMat.k[2] = shape.inlineMaterial.k.Z;
-            gpuMat.type = static_cast<uint32_t>(shape.inlineMaterial.type);
-            gpuMat.intIOR = shape.inlineMaterial.intIOR;
-            gpuMat.extIOR = shape.inlineMaterial.extIOR;
-            gpuMat.metallic = 0.0f;
-            gpuMat.baseColorTexIdx = shape.inlineMaterial.baseColorTexture.textureIndex;
-            gpuMat.roughnessTexIdx = shape.inlineMaterial.roughnessTexture.textureIndex;
-            gpuMat.normalTexIdx = shape.inlineMaterial.normalTexture.textureIndex;
+            GPUMaterial gpuMat = {};
+            const auto& mat = shape.inlineMaterial;
+            gpuMat.baseColor[0] = mat.baseColor.X;
+            gpuMat.baseColor[1] = mat.baseColor.Y;
+            gpuMat.baseColor[2] = mat.baseColor.Z;
+            gpuMat.roughness = mat.roughness;
+            gpuMat.eta[0] = mat.eta.X;
+            gpuMat.eta[1] = mat.eta.Y;
+            gpuMat.eta[2] = mat.eta.Z;
+            gpuMat.k[0] = mat.k.X;
+            gpuMat.k[1] = mat.k.Y;
+            gpuMat.k[2] = mat.k.Z;
+            gpuMat.type = static_cast<uint32_t>(mat.type);
+            gpuMat.intIOR = mat.intIOR;
+            gpuMat.extIOR = mat.extIOR;
+            gpuMat.metallic = mat.metallic;
+            if (mat.type == MaterialType::Conductor || mat.type == MaterialType::RoughConductor)
+                gpuMat.metallic = 1.0f;
+            gpuMat.baseColorTexIdx = mat.baseColorTexture.textureIndex;
+            gpuMat.roughnessTexIdx = mat.roughnessTexture.textureIndex;
+            gpuMat.normalTexIdx = mat.normalTexture.textureIndex;
+            gpuMat.specular = mat.specular;
+            gpuMat.specTint = mat.specTint;
+            gpuMat.sheen = mat.sheen;
+            gpuMat.sheenTint = mat.sheenTint;
+            gpuMat.clearcoat = mat.clearcoat;
+            gpuMat.clearcoatGloss = mat.clearcoatGloss;
+            gpuMat.specTrans = mat.specTrans;
+            gpuMat.opacity = mat.opacity;
+            gpuMat.blendWeight = mat.blendWeight;
             matIndex = static_cast<uint32_t>(m_Materials.size());
             m_Materials.push_back(gpuMat);
         }
@@ -1458,7 +1681,7 @@ public:
         
         // Initialize camera constants
         m_CameraConstants.samplesPerPixel = 1;
-        m_CameraConstants.maxBounces = 8;
+        m_CameraConstants.maxBounces = 16;  // Higher for multiple mirror reflections
         
         log::info("Camera position: (%.2f, %.2f, %.2f)", m_CameraPosition.X, m_CameraPosition.Y, m_CameraPosition.Z);
         log::info("Camera forward: (%.2f, %.2f, %.2f)", forward.X, forward.Y, forward.Z);

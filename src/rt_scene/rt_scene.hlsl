@@ -33,7 +33,21 @@ struct GPUMaterial
     int roughnessTexIdx;   // -1 if no texture
     
     int normalTexIdx;      // -1 if no texture
-    float3 padding;
+    
+    // Principled BSDF parameters
+    float specular;        // Specular intensity
+    float specTint;        // Tint specular towards base color
+    float sheen;           // Sheen intensity
+    
+    float sheenTint;       // Tint sheen towards base color
+    float clearcoat;       // Clearcoat intensity
+    float clearcoatGloss;  // Clearcoat glossiness
+    float specTrans;       // Specular transmission
+    
+    // Mask/Blend parameters
+    float opacity;         // Opacity for mask material
+    float blendWeight;     // Blend weight for blendbsdf
+    float2 padding;
 };
 
 struct GPUInstance
@@ -166,6 +180,20 @@ MaterialParams GPUMaterialToParams(GPUMaterial gpuMat)
     params.type = gpuMat.type;
     params.intIOR = gpuMat.intIOR;
     params.extIOR = gpuMat.extIOR;
+    
+    // Principled BSDF parameters
+    params.specular = gpuMat.specular;
+    params.specTint = gpuMat.specTint;
+    params.sheen = gpuMat.sheen;
+    params.sheenTint = gpuMat.sheenTint;
+    params.clearcoat = gpuMat.clearcoat;
+    params.clearcoatGloss = gpuMat.clearcoatGloss;
+    params.specTrans = gpuMat.specTrans;
+    
+    // Mask/Blend parameters
+    params.opacity = gpuMat.opacity;
+    params.blendWeight = gpuMat.blendWeight;
+    
     return params;
 }
 
@@ -275,6 +303,38 @@ GPUMaterial GetMaterialWithTextures(uint materialIndex, float2 texcoord)
     return mat;
 }
 
+// Apply normal map to geometric normal
+float3 ApplyNormalMapFromTexture(float3 geometricNormal, int normalTexIdx, float2 texcoord)
+{
+    if (normalTexIdx < 0)
+        return geometricNormal;
+    
+    float4 normalMapSample = SampleMaterialTexture(normalTexIdx, texcoord);
+    
+    // Decode tangent-space normal from [0,1] to [-1,1]
+    float3 tsNormal = normalMapSample.xyz * 2.0f - 1.0f;
+    tsNormal = normalize(tsNormal);
+    
+    // Build orthonormal basis around geometric normal
+    float3 tangent, bitangent;
+    BuildOrthonormalBasis(geometricNormal, tangent, bitangent);
+    
+    // Transform from tangent space to world space
+    float3 worldNormal = normalize(
+        tsNormal.x * tangent +
+        tsNormal.y * bitangent +
+        tsNormal.z * geometricNormal
+    );
+    
+    return worldNormal;
+}
+
+// Get material with texture sampling, also applies normal map
+float3 GetShadingNormal(float3 geometricNormal, GPUMaterial mat, float2 texcoord)
+{
+    return ApplyNormalMapFromTexture(geometricNormal, mat.normalTexIdx, texcoord);
+}
+
 // ============================================================================
 // Ray Generation Shader
 // ============================================================================
@@ -360,8 +420,11 @@ void RayGen()
         // Get material with texture sampling
         GPUMaterial mat = GetMaterialWithTextures(instance.materialIndex, payload.texcoord);
         
-        // Get interpolated normal (stored in payload.color for simplicity)
-        float3 normal = payload.color;
+        // Get interpolated geometric normal (stored in payload.color for simplicity)
+        float3 geometricNormal = payload.color;
+        
+        // Apply normal map to get shading normal
+        float3 normal = GetShadingNormal(geometricNormal, mat, payload.texcoord);
         
         // Make sure normal faces the ray
         if (dot(normal, ray.Direction) > 0.0f)
@@ -385,8 +448,8 @@ void RayGen()
         
         // Update throughput using the pre-computed sample weight
         // sampleWeight already includes BRDF * cos / pdf for importance sampled materials
-        float cosTheta = abs(NdotL);
-        throughput *= sampleWeight * cosTheta;
+        // So we should NOT multiply by cosTheta again
+        throughput *= sampleWeight;
         
         // Check for invalid throughput (NaN or Inf)
         if (any(isnan(throughput)) || any(isinf(throughput)))
