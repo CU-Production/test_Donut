@@ -172,10 +172,13 @@ float3 SmoothPlastic_SampleNonlinear(float3 diffuseColor, float intIOR, float ex
         float diffPdf = NdotL * INV_PI;
         pdf = probSpec * specPdf + (1.0f - probSpec) * diffPdf;
         
-        // Specular weight (white for dielectric)
+        // Specular weight (white for dielectric) - with reduced specular intensity
         float Fh = FresnelDielectric(VdotH, eta);
-        float3 specular = float3(Fh, Fh, Fh) * D * G / (4.0f * NdotV * NdotL + EPSILON);
-        float3 diffuse = effectiveDiffuse * INV_PI * (1.0f - F) * (1.0f - FresnelDielectric(NdotL, eta));
+        float specularScale = 0.3f;  // Match evaluation function
+        float3 specular = float3(Fh, Fh, Fh) * D * G * specularScale / (4.0f * NdotV * NdotL + EPSILON);
+        float Fl_spec = FresnelDielectric(NdotL, eta);
+        float transmissionBoost = 1.0f + 0.5f * (1.0f - NdotV);
+        float3 diffuse = effectiveDiffuse * INV_PI * (1.0f - F * 0.5f) * (1.0f - Fl_spec * 0.5f) * transmissionBoost;
         throughputWeight = (specular + diffuse) * NdotL / (pdf + EPSILON);
         return wi;
     }
@@ -202,13 +205,15 @@ float3 SmoothPlastic_SampleNonlinear(float3 diffuseColor, float intIOR, float ex
         float diffPdf = NdotL * INV_PI;
         pdf = probSpec * specPdf + (1.0f - probSpec) * diffPdf;
         
-        // Full BRDF evaluation
+        // Full BRDF evaluation with reduced specular
         float D = D_GGX(NdotH, alpha);
         float G = G_SmithGGX(NdotV, NdotL, alpha);
         float Fh = FresnelDielectric(VdotH, eta);
-        float3 specular = float3(Fh, Fh, Fh) * D * G / (4.0f * NdotV * NdotL + EPSILON);
+        float specularScale = 0.3f;  // Match evaluation function
+        float3 specular = float3(Fh, Fh, Fh) * D * G * specularScale / (4.0f * NdotV * NdotL + EPSILON);
         float Fl = FresnelDielectric(NdotL, eta);
-        float3 diffuse = effectiveDiffuse * INV_PI * (1.0f - F) * (1.0f - Fl);
+        float transmissionBoost = 1.0f + 0.5f * (1.0f - NdotV);
+        float3 diffuse = effectiveDiffuse * INV_PI * (1.0f - F * 0.5f) * (1.0f - Fl * 0.5f) * transmissionBoost;
         throughputWeight = (specular + diffuse) * NdotL / (pdf + EPSILON);
         return wi;
     }
