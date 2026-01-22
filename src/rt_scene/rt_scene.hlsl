@@ -70,6 +70,8 @@ struct CameraConstants
     uint maxBounces;
     float envMapIntensity;
     uint hasEnvMap;
+    float exposure;
+    float3 padding;
 };
 
 struct HitInfo
@@ -558,11 +560,8 @@ void RayGen()
     AccumulationTexture[launchIndex] = float4(newColor, sampleCount);
     
     // Exposure control - apply before tone mapping
-    // Mitsuba scenes often have high radiance values, need proper exposure
-    // Area light radiance ~125, wall reflectance ~0.58
-    // Single bounce contribution ~72, need very low exposure
-    float exposure = 0.015f;  // Very low exposure for bright Mitsuba scenes
-    float3 exposed = newColor * exposure;
+    // Use exposure value from constant buffer (controlled via ImGui)
+    float3 exposed = newColor * Camera.exposure;
     
     // ACES filmic tone mapping (better for high dynamic range)
     // Based on: https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/

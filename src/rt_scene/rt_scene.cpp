@@ -4,9 +4,11 @@
 #include <donut/engine/CommonRenderPasses.h>
 #include <donut/engine/BindingCache.h>
 #include <donut/app/DeviceManager.h>
+#include <donut/app/imgui_renderer.h>
 #include <donut/core/log.h>
 #include <donut/core/vfs/VFS.h>
 #include <nvrhi/utils.h>
+#include <imgui.h>
 
 #include <pugixml.hpp>
 
@@ -115,6 +117,8 @@ struct CameraConstants
     uint32_t maxBounces;
     float envMapIntensity;
     uint32_t hasEnvMap;
+    float exposure;          // Exposure control for tone mapping
+    float padding[3];        // Padding to align to 16 bytes
 };
 
 // ============================================================================
@@ -998,6 +1002,18 @@ private:
     // Keyboard state
     bool m_KeyW = false, m_KeyS = false, m_KeyA = false, m_KeyD = false;
     bool m_KeyQ = false, m_KeyE = false;
+    
+    // Rendering parameters (adjustable via ImGui)
+    float m_Exposure = 0.015f;
+    
+public:
+    // Accessors for UI
+    float& GetExposure() { return m_Exposure; }
+    uint32_t& GetMaxBounces() { return m_CameraConstants.maxBounces; }
+    uint32_t GetFrameIndex() const { return m_FrameIndex; }
+    void ResetAccumulation() { m_FrameIndex = 0; }
+    
+private:
 
     // Scene path
     std::filesystem::path m_ScenePath;
@@ -1910,6 +1926,7 @@ public:
         m_CameraConstants.frameIndex = m_FrameIndex;
         m_CameraConstants.envMapIntensity = m_SceneParser.environmentMap.intensity;
         m_CameraConstants.hasEnvMap = m_SceneParser.environmentMap.isValid ? 1 : 0;
+        m_CameraConstants.exposure = m_Exposure;
 
         // Debug: print first frame info
         static bool firstFrame = true;
@@ -1950,6 +1967,61 @@ public:
         GetDevice()->executeCommandList(m_CommandList);
 
         m_FrameIndex++;
+    }
+};
+
+// ============================================================================
+// ImGui UI Renderer
+// ============================================================================
+class UIRenderer : public app::ImGui_Renderer
+{
+private:
+    RayTracedScene* m_pScene = nullptr;
+    
+public:
+    UIRenderer(app::DeviceManager* deviceManager, RayTracedScene* scene)
+        : ImGui_Renderer(deviceManager)
+        , m_pScene(scene)
+    {
+    }
+    
+protected:
+    void buildUI() override
+    {
+        if (!m_pScene)
+            return;
+            
+        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(300, 200), ImGuiCond_FirstUseEver);
+        
+        if (ImGui::Begin("Render Settings"))
+        {
+            ImGui::Text("Frame: %u", m_pScene->GetFrameIndex());
+            ImGui::Separator();
+            
+            // Exposure control
+            float exposure = m_pScene->GetExposure();
+            if (ImGui::SliderFloat("Exposure", &exposure, 0.001f, 1.0f, "%.4f", ImGuiSliderFlags_Logarithmic))
+            {
+                m_pScene->GetExposure() = exposure;
+                m_pScene->ResetAccumulation();
+            }
+            
+            // Max bounces control
+            int maxBounces = static_cast<int>(m_pScene->GetMaxBounces());
+            if (ImGui::SliderInt("Max Bounces", &maxBounces, 1, 32))
+            {
+                m_pScene->GetMaxBounces() = static_cast<uint32_t>(maxBounces);
+                m_pScene->ResetAccumulation();
+            }
+            
+            ImGui::Separator();
+            ImGui::Text("Controls:");
+            ImGui::BulletText("WASD - Move camera");
+            ImGui::BulletText("QE - Move up/down");
+            ImGui::BulletText("Right Mouse - Look around");
+        }
+        ImGui::End();
     }
 };
 
@@ -2033,11 +2105,26 @@ int main(int __argc, const char** __argv)
     }
 
     {
+        // Create shader factory for ImGui
+        std::shared_ptr<vfs::RootFileSystem> rootFs = std::make_shared<vfs::RootFileSystem>();
+        rootFs->mount("/", std::filesystem::current_path().parent_path() / "shaders");
+
+        std::filesystem::path frameworkShaderPath = app::GetDirectoryWithExecutable() / "shaders/framework" / app::GetShaderTypeName(deviceManager->GetDevice()->getGraphicsAPI());
+        rootFs->mount("/donut", frameworkShaderPath);
+
+        std::shared_ptr<engine::ShaderFactory> shaderFactory = std::make_shared<engine::ShaderFactory>(
+            deviceManager->GetDevice(), rootFs, "/");
+        
         RayTracedScene example(deviceManager, scenePath);
         if (example.Init())
         {
+            UIRenderer ui(deviceManager, &example);
+            ui.Init(shaderFactory);
+            
             deviceManager->AddRenderPassToBack(&example);
+            deviceManager->AddRenderPassToBack(&ui);
             deviceManager->RunMessageLoop();
+            deviceManager->RemoveRenderPass(&ui);
             deviceManager->RemoveRenderPass(&example);
         }
     }
