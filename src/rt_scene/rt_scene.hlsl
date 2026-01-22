@@ -73,10 +73,12 @@ struct CameraConstants
 
 struct HitInfo
 {
-    float3 color;
+    float3 color;       // Used to pass normal
     float hitT;
     float3 emission;
     uint instanceID;
+    float2 texcoord;    // Interpolated texture coordinates
+    float2 padding;
 };
 
 struct ShadowHitInfo
@@ -99,6 +101,10 @@ StructuredBuffer<uint> Indices                 : register(t2);
 StructuredBuffer<GPUMaterial> Materials        : register(t3);
 StructuredBuffer<GPUInstance> Instances        : register(t4);
 Texture2D<float4> EnvironmentMap               : register(t5);
+
+// Material textures array - uses unbounded descriptor array
+// Maximum 64 material textures supported
+Texture2D<float4> MaterialTextures[64]         : register(t6);
 
 RWTexture2D<float4> OutputTexture              : register(u0);
 RWTexture2D<float4> AccumulationTexture        : register(u1);
@@ -396,9 +402,62 @@ float3 GetInterpolatedNormal(uint instanceID, uint primitiveIndex, float2 baryce
     return normalize(normal);
 }
 
+float2 GetInterpolatedTexcoord(uint instanceID, uint primitiveIndex, float2 barycentrics)
+{
+    GPUInstance instance = Instances[instanceID];
+    
+    // Get triangle vertex indices (global indices into vertex buffer)
+    uint i0 = Indices[instance.indexOffset + primitiveIndex * 3 + 0];
+    uint i1 = Indices[instance.indexOffset + primitiveIndex * 3 + 1];
+    uint i2 = Indices[instance.indexOffset + primitiveIndex * 3 + 2];
+    
+    // Fetch vertex texcoords
+    float2 t0 = Vertices[i0].texcoord;
+    float2 t1 = Vertices[i1].texcoord;
+    float2 t2 = Vertices[i2].texcoord;
+    
+    // Barycentric interpolation
+    float2 texcoord = t0 * (1.0f - barycentrics.x - barycentrics.y) +
+                      t1 * barycentrics.x +
+                      t2 * barycentrics.y;
+    
+    return texcoord;
+}
+
 float3 GetHitPosition(float3 rayOrigin, float3 rayDirection, float hitT)
 {
     return rayOrigin + rayDirection * hitT;
+}
+
+// Sample material texture with index validation
+float4 SampleMaterialTexture(int textureIndex, float2 texcoord)
+{
+    if (textureIndex < 0 || textureIndex >= 64)
+        return float4(1.0f, 1.0f, 1.0f, 1.0f);
+    
+    return MaterialTextures[NonUniformResourceIndex(textureIndex)].SampleLevel(LinearSampler, texcoord, 0);
+}
+
+// Get material with texture sampling
+GPUMaterial GetMaterialWithTextures(uint materialIndex, float2 texcoord)
+{
+    GPUMaterial mat = Materials[materialIndex];
+    
+    // Sample base color texture if available
+    if (mat.baseColorTexIdx >= 0)
+    {
+        float4 texColor = SampleMaterialTexture(mat.baseColorTexIdx, texcoord);
+        mat.baseColor = texColor.rgb;
+    }
+    
+    // Sample roughness texture if available
+    if (mat.roughnessTexIdx >= 0)
+    {
+        float4 texRoughness = SampleMaterialTexture(mat.roughnessTexIdx, texcoord);
+        mat.roughness = texRoughness.r;  // Assume roughness in red channel
+    }
+    
+    return mat;
 }
 
 // ============================================================================
@@ -482,7 +541,9 @@ void RayGen()
         // Get hit information
         float3 hitPos = GetHitPosition(ray.Origin, ray.Direction, payload.hitT);
         GPUInstance instance = Instances[payload.instanceID];
-        GPUMaterial mat = Materials[instance.materialIndex];
+        
+        // Get material with texture sampling
+        GPUMaterial mat = GetMaterialWithTextures(instance.materialIndex, payload.texcoord);
         
         // Get interpolated normal (stored in payload.color for simplicity)
         float3 normal = payload.color;
@@ -558,8 +619,9 @@ void ClosestHit(inout HitInfo payload, in Attributes attrib)
     uint instanceID = InstanceID();
     uint primitiveIndex = PrimitiveIndex();
     
-    // Get interpolated normal
+    // Get interpolated normal and texcoord
     float3 normal = GetInterpolatedNormal(instanceID, primitiveIndex, attrib.barycentrics);
+    float2 texcoord = GetInterpolatedTexcoord(instanceID, primitiveIndex, attrib.barycentrics);
     
     GPUInstance instance = Instances[instanceID];
     
@@ -567,6 +629,7 @@ void ClosestHit(inout HitInfo payload, in Attributes attrib)
     payload.color = normal;
     payload.hitT = RayTCurrent();
     payload.instanceID = instanceID;
+    payload.texcoord = texcoord;
     
     // Check if this is an emitter
     if (instance.isEmitter != 0)

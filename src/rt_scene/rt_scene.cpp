@@ -724,8 +724,11 @@ private:
     
     // Textures
     nvrhi::TextureHandle m_EnvironmentMap;
+    nvrhi::TextureHandle m_DefaultMaterialTexture;  // 1x1 white texture for empty slots
     std::vector<nvrhi::TextureHandle> m_MaterialTextures;
     nvrhi::SamplerHandle m_LinearSampler;
+    
+    static constexpr int MAX_MATERIAL_TEXTURES = 64;
 
     // Render passes
     std::shared_ptr<engine::CommonRenderPasses> m_CommonPasses;
@@ -820,6 +823,7 @@ public:
             nvrhi::BindingLayoutItem::StructuredBuffer_SRV(3),      // t3: Materials
             nvrhi::BindingLayoutItem::StructuredBuffer_SRV(4),      // t4: Instances
             nvrhi::BindingLayoutItem::Texture_SRV(5),               // t5: Environment map
+            nvrhi::BindingLayoutItem::Texture_SRV(6).setSize(MAX_MATERIAL_TEXTURES),  // t6-t69: Material textures array
             nvrhi::BindingLayoutItem::Texture_UAV(0),               // u0: Output
             nvrhi::BindingLayoutItem::Texture_UAV(1),               // u1: Accumulation
             nvrhi::BindingLayoutItem::ConstantBuffer(0),            // b0: Camera
@@ -1292,6 +1296,25 @@ public:
     
     void CreateMaterialTextures()
     {
+        // Create default 1x1 white texture for empty slots
+        {
+            nvrhi::TextureDesc textureDesc;
+            textureDesc.width = 1;
+            textureDesc.height = 1;
+            textureDesc.format = nvrhi::Format::RGBA32_FLOAT;
+            textureDesc.initialState = nvrhi::ResourceStates::ShaderResource;
+            textureDesc.keepInitialState = true;
+            textureDesc.debugName = "DefaultMaterialTexture";
+            
+            m_DefaultMaterialTexture = GetDevice()->createTexture(textureDesc);
+            
+            float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+            m_CommandList->open();
+            m_CommandList->writeTexture(m_DefaultMaterialTexture, 0, 0, white, sizeof(white));
+            m_CommandList->close();
+            GetDevice()->executeCommandList(m_CommandList);
+        }
+        
         // Create textures from loaded texture data
         for (const auto& texData : m_SceneParser.loadedTextures)
         {
@@ -1564,6 +1587,20 @@ public:
                 nvrhi::BindingSetItem::ConstantBuffer(0, m_CameraBuffer),
                 nvrhi::BindingSetItem::Sampler(0, m_LinearSampler)
             };
+            
+            // Add material textures array (64 slots starting at t6)
+            for (int i = 0; i < MAX_MATERIAL_TEXTURES; i++)
+            {
+                nvrhi::TextureHandle tex = m_DefaultMaterialTexture;
+                if (i < static_cast<int>(m_MaterialTextures.size()))
+                {
+                    tex = m_MaterialTextures[i];
+                }
+                bindingSetDesc.bindings.push_back(
+                    nvrhi::BindingSetItem::Texture_SRV(6, tex).setArrayElement(i)
+                );
+            }
+            
             m_BindingSet = GetDevice()->createBindingSet(bindingSetDesc, m_BindingLayout);
         }
 
