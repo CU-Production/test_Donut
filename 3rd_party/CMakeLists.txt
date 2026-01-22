@@ -1,7 +1,7 @@
 # Enable DLSS before adding Donut
 # Note: DLSS static library uses /MT runtime which conflicts with /MD in Debug mode
 # Use Release mode to avoid linker errors
-set(DONUT_WITH_DLSS ON CACHE BOOL "Enable DLSS" FORCE)
+set(DONUT_WITH_DLSS OFF CACHE BOOL "Enable DLSS" FORCE)
 
 # donut
 add_subdirectory(Donut)

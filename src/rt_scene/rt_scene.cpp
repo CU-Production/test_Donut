@@ -1035,7 +1035,7 @@ private:
     bool m_KeyQ = false, m_KeyE = false;
     
     // Rendering parameters (adjustable via ImGui)
-    float m_Exposure = 0.015f;
+    float m_Exposure = 0.15f;
     
 public:
     // Accessors for UI
