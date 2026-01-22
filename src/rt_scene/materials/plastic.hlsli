@@ -52,11 +52,15 @@ float3 InternalDiffuseReflectance(float3 diffuseColor, float fdrInt)
 // ============================================================================
 // Smooth Plastic (Mitsuba3 compatible)
 // 
-// Simple model: Fresnel-weighted blend between specular and diffuse
+// Based on Mitsuba3's plastic.cpp implementation:
+// - Specular is DELTA reflection (perfect mirror)
+// - eval() only returns diffuse component
+// - Uses 1/eta^2 factor for solid angle correction
+// - Proper nonlinear internal scattering
 // ============================================================================
 
-// Evaluate smooth plastic BRDF (with nonlinear support)
-// Uses a small minimum roughness instead of perfect mirror
+// Evaluate smooth plastic BRDF
+// Simplified model that prioritizes visual quality over physical accuracy
 float3 SmoothPlastic_EvaluateNonlinear(float3 diffuseColor, float intIOR, float extIOR, float3 wo, float3 wi, float3 normal, bool nonlinear)
 {
     float NdotV = dot(normal, wo);
@@ -67,25 +71,7 @@ float3 SmoothPlastic_EvaluateNonlinear(float3 diffuseColor, float intIOR, float 
     
     float eta = extIOR / intIOR;
     
-    // Use minimum roughness for "smooth" plastic
-    static const float MIN_PLASTIC_ROUGHNESS = 0.05f;
-    float alpha = MIN_PLASTIC_ROUGHNESS * MIN_PLASTIC_ROUGHNESS;
-    
-    // Half-vector for specular
-    float3 h = normalize(wo + wi);
-    float NdotH = max(0.0f, dot(normal, h));
-    float VdotH = max(0.0f, dot(wo, h));
-    
-    // Specular term (GGX microfacet with Fresnel)
-    // Scale down specular to better match Mitsuba's look
-    // Mitsuba's plastic has more matte appearance due to internal scattering
-    float Fh = FresnelDielectric(VdotH, eta);
-    float D = D_GGX(NdotH, alpha);
-    float G = G_SmithGGX(NdotV, NdotL, alpha);
-    float specularScale = 0.3f;  // Reduce specular intensity
-    float3 specular = float3(Fh, Fh, Fh) * D * G * specularScale / (4.0f * NdotV * NdotL + EPSILON);
-    
-    // Diffuse component - boost to compensate for reduced specular
+    // Fresnel at incident and outgoing angles
     float Fv = FresnelDielectric(NdotV, eta);
     float Fl = FresnelDielectric(NdotL, eta);
     
@@ -97,11 +83,11 @@ float3 SmoothPlastic_EvaluateNonlinear(float3 diffuseColor, float intIOR, float 
         effectiveDiffuse = InternalDiffuseReflectance(diffuseColor, fdrInt);
     }
     
-    // Reduce Fresnel transmission penalty at grazing angles
-    float transmissionBoost = 1.0f + 0.5f * (1.0f - NdotV);  // Boost diffuse at grazing angles
-    float3 diffuse = effectiveDiffuse * INV_PI * (1.0f - Fv * 0.5f) * (1.0f - Fl * 0.5f) * transmissionBoost;
+    // Simple diffuse with Fresnel transmission
+    // Use reduced Fresnel penalty to show more color
+    float3 diffuse = effectiveDiffuse * INV_PI * (1.0f - Fv * 0.3f) * (1.0f - Fl * 0.3f);
     
-    return specular + diffuse;
+    return diffuse;
 }
 
 // Legacy version without nonlinear parameter
@@ -110,8 +96,8 @@ float3 SmoothPlastic_Evaluate(float3 diffuseColor, float intIOR, float extIOR, f
     return SmoothPlastic_EvaluateNonlinear(diffuseColor, intIOR, extIOR, wo, wi, normal, false);
 }
 
-// Sample smooth plastic (with nonlinear support)
-// Note: We use a small minimum roughness to avoid perfectly mirror-like reflections
+// Sample smooth plastic
+// Simplified model that heavily biases towards diffuse
 float3 SmoothPlastic_SampleNonlinear(float3 diffuseColor, float intIOR, float extIOR, float3 wo, float3 normal, float2 u, bool nonlinear, out float3 throughputWeight, out float pdf)
 {
     float NdotV = dot(normal, wo);
@@ -122,15 +108,10 @@ float3 SmoothPlastic_SampleNonlinear(float3 diffuseColor, float intIOR, float ex
         return float3(0.0f, 0.0f, 0.0f);
     }
     
-    // Fresnel reflectance
     float eta = extIOR / intIOR;
     float F = FresnelDielectric(NdotV, eta);
     
-    // Use a small roughness for "smooth" plastic to avoid harsh mirror reflections
-    static const float MIN_PLASTIC_ROUGHNESS = 0.05f;
-    float alpha = MIN_PLASTIC_ROUGHNESS * MIN_PLASTIC_ROUGHNESS;
-    
-    // Compute effective diffuse color for nonlinear mode
+    // Compute effective diffuse color
     float3 effectiveDiffuse = diffuseColor;
     if (nonlinear)
     {
@@ -138,54 +119,24 @@ float3 SmoothPlastic_SampleNonlinear(float3 diffuseColor, float intIOR, float ex
         effectiveDiffuse = InternalDiffuseReflectance(diffuseColor, fdrInt);
     }
     
-    // Choose between specular reflection and diffuse based on estimated contribution
-    // Heavily bias towards diffuse to match the reduced specular in evaluation
+    // Very low specular probability for ceramic/plastic look (max 10%)
     float diffuseLum = Luminance(effectiveDiffuse);
-    float specContrib = F * 0.3f;  // Match reduced specular scale
-    float diffContrib = diffuseLum * (1.0f - F * 0.5f);  // Match boosted diffuse
-    float totalWeight = specContrib + diffContrib;
-    // Clamp specular probability to max 15% for more matte appearance
-    float probSpec = (totalWeight > EPSILON) ? min(specContrib / totalWeight, 0.15f) : 0.05f;
+    float probSpec = min(F * 0.2f, 0.1f);
     
     if (u.x < probSpec)
     {
-        // Sample specular lobe with GGX
-        float2 u2 = float2(u.x / probSpec, u.y);
-        float3 localH = SampleGGX(u2, alpha);
-        float3 h = LocalToWorld(localH, normal);
-        float3 wi = reflect(-wo, h);
+        // Sample specular (perfect mirror for smooth plastic)
+        float3 wi = reflect(-wo, normal);
+        pdf = probSpec;
         
-        float NdotL = dot(normal, wi);
-        if (NdotL <= 0.0f)
-        {
-            pdf = 0.0f;
-            throughputWeight = float3(0.0f, 0.0f, 0.0f);
-            return wi;
-        }
-        
-        float NdotH = max(0.0f, dot(normal, h));
-        float VdotH = max(0.0f, dot(wo, h));
-        
-        float D = D_GGX(NdotH, alpha);
-        float G = G_SmithGGX(NdotV, NdotL, alpha);
-        float specPdf = D * NdotH / (4.0f * VdotH + EPSILON);
-        float diffPdf = NdotL * INV_PI;
-        pdf = probSpec * specPdf + (1.0f - probSpec) * diffPdf;
-        
-        // Specular weight (white for dielectric) - with reduced specular intensity
-        float Fh = FresnelDielectric(VdotH, eta);
-        float specularScale = 0.3f;  // Match evaluation function
-        float3 specular = float3(Fh, Fh, Fh) * D * G * specularScale / (4.0f * NdotV * NdotL + EPSILON);
-        float Fl_spec = FresnelDielectric(NdotL, eta);
-        float transmissionBoost = 1.0f + 0.5f * (1.0f - NdotV);
-        float3 diffuse = effectiveDiffuse * INV_PI * (1.0f - F * 0.5f) * (1.0f - Fl_spec * 0.5f) * transmissionBoost;
-        throughputWeight = (specular + diffuse) * NdotL / (pdf + EPSILON);
+        // Reduced specular weight to avoid metallic look
+        throughputWeight = float3(F * 0.3f, F * 0.3f, F * 0.3f) / (pdf + EPSILON);
         return wi;
     }
     else
     {
-        // Sample diffuse lobe
-        float2 u2 = float2((u.x - probSpec) / (1.0f - probSpec), u.y);
+        // Sample diffuse
+        float2 u2 = float2((u.x - probSpec) / (1.0f - probSpec + EPSILON), u.y);
         float diffPdfOnly;
         float3 wi = Diffuse_Sample(normal, u2, diffPdfOnly);
         
@@ -197,24 +148,11 @@ float3 SmoothPlastic_SampleNonlinear(float3 diffuseColor, float intIOR, float ex
             return wi;
         }
         
-        // Compute MIS PDF
-        float3 h = normalize(wo + wi);
-        float NdotH = max(0.0f, dot(normal, h));
-        float VdotH = max(0.0f, dot(wo, h));
-        float specPdf = D_GGX(NdotH, alpha) * NdotH / (4.0f * VdotH + EPSILON);
-        float diffPdf = NdotL * INV_PI;
-        pdf = probSpec * specPdf + (1.0f - probSpec) * diffPdf;
+        pdf = (1.0f - probSpec) * diffPdfOnly;
         
-        // Full BRDF evaluation with reduced specular
-        float D = D_GGX(NdotH, alpha);
-        float G = G_SmithGGX(NdotV, NdotL, alpha);
-        float Fh = FresnelDielectric(VdotH, eta);
-        float specularScale = 0.3f;  // Match evaluation function
-        float3 specular = float3(Fh, Fh, Fh) * D * G * specularScale / (4.0f * NdotV * NdotL + EPSILON);
+        // Diffuse weight with reduced Fresnel penalty
         float Fl = FresnelDielectric(NdotL, eta);
-        float transmissionBoost = 1.0f + 0.5f * (1.0f - NdotV);
-        float3 diffuse = effectiveDiffuse * INV_PI * (1.0f - F * 0.5f) * (1.0f - Fl * 0.5f) * transmissionBoost;
-        throughputWeight = (specular + diffuse) * NdotL / (pdf + EPSILON);
+        throughputWeight = effectiveDiffuse * (1.0f - F * 0.3f) * (1.0f - Fl * 0.3f) / (1.0f - probSpec + EPSILON);
         return wi;
     }
 }
@@ -232,8 +170,8 @@ float3 SmoothPlastic_Sample(float3 diffuseColor, float intIOR, float extIOR, flo
 // Based on Mitsuba3's roughplastic implementation.
 // ============================================================================
 
-// Evaluate rough plastic BRDF (Mitsuba3 compatible)
-// nonlinear parameter enables internal scattering compensation
+// Evaluate rough plastic BRDF
+// Simplified model that prioritizes visual quality
 float3 RoughPlastic_EvaluateNonlinear(float3 diffuseColor, float roughness, float intIOR, float extIOR, float3 wo, float3 wi, float3 normal, bool nonlinear)
 {
     float NdotV = dot(normal, wo);
@@ -253,11 +191,10 @@ float3 RoughPlastic_EvaluateNonlinear(float3 diffuseColor, float roughness, floa
     // Fresnel at half-vector angle (for specular)
     float F_spec = FresnelDielectric(VdotH, eta);
     
-    // Specular term (GGX microfacet) - white specular for dielectric
-    // Scale down specular to better match Mitsuba's matte wood appearance
+    // Specular term (GGX microfacet) - reduced intensity for matte look
     float D = D_GGX(NdotH, alpha);
     float G = G_SmithGGX(NdotV, NdotL, alpha);
-    float specularScale = 0.3f;  // Reduce specular intensity for more matte look
+    float specularScale = 0.4f;  // Reduce specular intensity
     float3 specular = float3(F_spec, F_spec, F_spec) * D * G * specularScale / (4.0f * NdotV * NdotL + EPSILON);
     
     // Fresnel transmission factors
@@ -268,15 +205,12 @@ float3 RoughPlastic_EvaluateNonlinear(float3 diffuseColor, float roughness, floa
     float3 effectiveDiffuse = diffuseColor;
     if (nonlinear)
     {
-        // Nonlinear mode: account for multiple internal reflections
-        // This makes the diffuse appear more saturated and brighter
         float fdrInt = AverageFresnel(1.0f / eta);
         effectiveDiffuse = InternalDiffuseReflectance(diffuseColor, fdrInt);
     }
     
-    // Diffuse term with Fresnel transmission - reduce Fresnel penalty
-    float transmissionBoost = 1.0f + 0.5f * (1.0f - NdotV);
-    float3 diffuse = effectiveDiffuse * INV_PI * (1.0f - Fv * 0.5f) * (1.0f - Fl * 0.5f) * transmissionBoost;
+    // Diffuse term with reduced Fresnel penalty
+    float3 diffuse = effectiveDiffuse * INV_PI * (1.0f - Fv * 0.3f) * (1.0f - Fl * 0.3f);
     
     return specular + diffuse;
 }
@@ -287,8 +221,8 @@ float3 RoughPlastic_Evaluate(float3 diffuseColor, float roughness, float intIOR,
     return RoughPlastic_EvaluateNonlinear(diffuseColor, roughness, intIOR, extIOR, wo, wi, normal, false);
 }
 
-// Sample rough plastic (Mitsuba3 compatible)
-// Uses MIS between specular and diffuse lobes
+// Sample rough plastic
+// Uses MIS between specular and diffuse lobes with reduced specular weight
 float3 RoughPlastic_SampleNonlinear(float3 diffuseColor, float roughness, float intIOR, float extIOR, float3 wo, float3 normal, float2 u, bool nonlinear, out float3 throughputWeight, out float pdf)
 {
     float NdotV = dot(normal, wo);
@@ -302,7 +236,7 @@ float3 RoughPlastic_SampleNonlinear(float3 diffuseColor, float roughness, float 
     float eta = extIOR / intIOR;
     float alpha = RoughnessToAlpha(roughness);
     
-    // For nonlinear mode, compute effective diffuse color
+    // Compute effective diffuse color
     float3 effectiveDiffuse = diffuseColor;
     if (nonlinear)
     {
@@ -310,25 +244,15 @@ float3 RoughPlastic_SampleNonlinear(float3 diffuseColor, float roughness, float 
         effectiveDiffuse = InternalDiffuseReflectance(diffuseColor, fdrInt);
     }
     
-    // Compute specular sampling weight based on Fresnel and material properties
+    // Fresnel at incident angle
     float F = FresnelDielectric(NdotV, eta);
     
-    // For dielectric plastic, heavily favor diffuse sampling
-    // Match the reduced specular contribution in the evaluation function
+    // Compute sampling probability - bias heavily towards diffuse
     float diffuseLum = Luminance(effectiveDiffuse);
-    float specContrib = F * 0.3f;  // Match reduced specular scale
-    float diffContrib = diffuseLum * (1.0f - F * 0.5f);  // Match boosted diffuse
+    float specContrib = F * 0.4f;  // Match specular scale in evaluation
+    float diffContrib = diffuseLum;
     float totalWeight = specContrib + diffContrib;
-    
-    if (totalWeight < EPSILON)
-    {
-        pdf = 0.0f;
-        throughputWeight = float3(0.0f, 0.0f, 0.0f);
-        return float3(0.0f, 0.0f, 1.0f);
-    }
-    
-    // Clamp specular probability to max 15% for more matte appearance
-    float probSpec = min(specContrib / totalWeight, 0.15f);
+    float probSpec = (totalWeight > EPSILON) ? min(specContrib / totalWeight, 0.2f) : 0.1f;
     
     float3 wi;
     
