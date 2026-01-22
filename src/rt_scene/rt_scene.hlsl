@@ -567,13 +567,26 @@ void RayGen()
         // Update throughput
         float3 brdf = EvaluateBRDF(mat, wo, wi, normal);
         float cosTheta = abs(dot(normal, wi));
-        throughput *= brdf * cosTheta / pdf;
+        throughput *= brdf * cosTheta / max(pdf, EPSILON);
+        
+        // Check for invalid throughput (NaN or Inf)
+        if (any(isnan(throughput)) || any(isinf(throughput)))
+        {
+            break;
+        }
+        
+        // Clamp throughput to prevent fireflies
+        float maxThroughput = max(throughput.x, max(throughput.y, throughput.z));
+        if (maxThroughput > 100.0f)
+        {
+            throughput *= 100.0f / maxThroughput;
+        }
         
         // Russian roulette
         if (bounce > 3)
         {
             float p = max(throughput.x, max(throughput.y, throughput.z));
-            if (RandomFloat(rng) > p)
+            if (p < EPSILON || RandomFloat(rng) > p)
             {
                 break;
             }
@@ -584,6 +597,14 @@ void RayGen()
         ray.Origin = hitPos + normal * RAY_EPSILON;
         ray.Direction = wi;
     }
+    
+    // Clamp radiance to avoid NaN/Inf contaminating accumulation
+    // This can happen due to numerical precision issues in BRDF calculations
+    if (any(isnan(radiance)) || any(isinf(radiance)))
+    {
+        radiance = float3(0.0f, 0.0f, 0.0f);
+    }
+    radiance = clamp(radiance, 0.0f, 100.0f);  // Clamp to reasonable range
     
     // Accumulation
     float3 prevColor = AccumulationTexture[launchIndex].xyz;
@@ -597,8 +618,17 @@ void RayGen()
     }
     else
     {
-        newColor = prevColor + (radiance - prevColor) / (sampleCount + 1.0f);
-        sampleCount += 1.0f;
+        // Check for corrupted accumulation buffer
+        if (any(isnan(prevColor)) || any(isinf(prevColor)) || sampleCount <= 0.0f)
+        {
+            newColor = radiance;
+            sampleCount = 1.0f;
+        }
+        else
+        {
+            newColor = prevColor + (radiance - prevColor) / (sampleCount + 1.0f);
+            sampleCount += 1.0f;
+        }
     }
     
     AccumulationTexture[launchIndex] = float4(newColor, sampleCount);
